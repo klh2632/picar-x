@@ -1,12 +1,48 @@
-from sunfounder_controller import SunFounderController
+from pathlib import Path
+import sys
+
+try:
+    from sunfounder_controller import SunFounderController
+except ImportError:
+    class SunFounderController:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def set_name(self, *args, **kwargs):
+            pass
+
+        def set_type(self, *args, **kwargs):
+            pass
+
+        def start(self, *args, **kwargs):
+            pass
+
+        def set(self, *args, **kwargs):
+            return None
+
+        def get(self, *args, **kwargs):
+            return None
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        vendor_dir = parent / ".vendor"
+        if vendor_dir.is_dir():
+            sys.path.insert(0, str(vendor_dir))
+        break
+
 from picarx import Picarx
 from robot_hat import utils, Music
 from vilib import Vilib
 import os
+import socket
+from pathlib import Path as _Path
+import pwd
 from time import sleep
 
 # reset robot_hat
-utils.reset_mcu()
+if hasattr(utils, "reset_mcu"):
+    utils.reset_mcu()
 sleep(0.2)
 
 # init SunFounder Controller class
@@ -31,12 +67,30 @@ DangerDistance = 20 # > 20 && < 40 turn around, < 20 backward
 DETECT_COLOR = 'red' # red, green, blue, yellow , orange, purple
 
 # init music player
-User = os.popen('echo ${SUDO_USER:-$LOGNAME}').readline().strip()
-UserHome = os.popen('getent passwd %s | cut -d: -f 6' %User).readline().strip()
+User = os.environ.get("SUDO_USER") or os.environ.get("LOGNAME") or pwd.getpwuid(os.getuid()).pw_name
+UserHome = pwd.getpwnam(User).pw_dir
 
 music = Music()
 if os.geteuid() != 0:
     print('\033[33mPlay sound needs to be run with sudo.\033[m')
+
+
+def get_local_ip():
+    """Resolve local IP using robot_hat utility when available, else stdlib fallback."""
+    if hasattr(utils, "get_ip"):
+        ip = utils.get_ip()
+        if ip:
+            return ip
+
+    # UDP socket trick: no packets are sent, but OS selects the outbound interface.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
 
 def horn(): 
     _status, _result = utils.run_command('sudo killall pulseaudio')
@@ -106,7 +160,7 @@ def line_track():
 def main():
     global speed
 
-    ip = utils.get_ip()
+    ip = get_local_ip()
     print('ip : %s'%ip)
     sc.set('video','http://'+ip+':9000/mjpg')
 

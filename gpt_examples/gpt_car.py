@@ -7,6 +7,14 @@ import readline # optimize keyboard input, only need to import
 
 import speech_recognition as sr
 
+from pathlib import Path
+import sys
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        break
+
 from picarx import Picarx
 from robot_hat import Music, Pin
 
@@ -15,7 +23,6 @@ import threading
 import random
 
 import os
-import sys
 
 os.popen("pinctrl set 20 op dh") # enable robot_hat speake switch
 current_path = os.path.dirname(os.path.abspath(__file__))

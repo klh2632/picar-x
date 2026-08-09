@@ -1,7 +1,18 @@
-from robot_hat import Pin, ADC, PWM, Servo, fileDB
-from robot_hat import Grayscale_Module, Ultrasonic, utils
-import time
 import os
+import sys
+from pathlib import Path
+
+VENDOR_DIR = Path(__file__).resolve().parent.parent / ".vendor"
+if VENDOR_DIR.exists():
+    sys.path.insert(0, str(VENDOR_DIR))
+
+try:
+    from robot_hat import Pin, ADC, PWM, Servo, fileDB
+    from robot_hat import Grayscale_Module, Ultrasonic, utils
+except ImportError:
+    from robot_hat import Pin, ADC, PWM, Servo, FileDB as fileDB
+    from robot_hat import Grayscale as Grayscale_Module, Ultrasonic, utils
+import time
 
 
 def constrain(x, min_val, max_val):
@@ -32,6 +43,13 @@ class Picarx(object):
     # grayscale_pins: 3 adc channels
     # ultrasonic_pins: trig, echo2
     # config: path of config file
+    def _apply_grayscale_reference(self):
+        reference = [int(value) for value in self.line_reference]
+        try:
+            self.grayscale.reference(reference)
+        except TypeError:
+            self.grayscale.reference = reference
+
     def __init__(self, 
                 servo_pins:list=['P0', 'P1', 'P2'], 
                 motor_pins:list=['D4', 'D5', 'P13', 'P12'],
@@ -40,12 +58,21 @@ class Picarx(object):
                 config:str=CONFIG,
                 ):
 
-        # reset robot_hat
-        utils.reset_mcu()
-        time.sleep(0.2)
+        # reset robot_hat on versions that expose this helper
+        if hasattr(utils, "reset_mcu"):
+            utils.reset_mcu()
+            time.sleep(0.2)
 
         # --------- config_flie ---------
-        self.config_flie = fileDB(config, 777, os.getlogin())
+        config_path = Path(config)
+        config_parent = config_path.parent
+        if not config_parent.exists() or not os.access(config_parent, os.W_OK):
+            config_path = Path.home() / ".config" / "picar-x" / "picar-x.conf"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.config_flie = fileDB(str(config_path), 777, os.getlogin())
+        except TypeError:
+            self.config_flie = fileDB(str(config_path))
 
         # --------- servos init ---------
         self.cam_pan = Servo(servo_pins[0])
@@ -79,14 +106,14 @@ class Picarx(object):
 
         # --------- grayscale module init ---------
         adc0, adc1, adc2 = [ADC(pin) for pin in grayscale_pins]
-        self.grayscale = Grayscale_Module(adc0, adc1, adc2, reference=None)
+        self.grayscale = Grayscale_Module(adc0, adc1, adc2, reference=list(self.DEFAULT_LINE_REF))
         # get reference
         self.line_reference = self.config_flie.get("line_reference", default_value=str(self.DEFAULT_LINE_REF))
         self.line_reference = [float(i) for i in self.line_reference.strip().strip('[]').split(',')]
         self.cliff_reference = self.config_flie.get("cliff_reference", default_value=str(self.DEFAULT_CLIFF_REF))
         self.cliff_reference = [float(i) for i in self.cliff_reference.strip().strip('[]').split(',')]
         # transfer reference
-        self.grayscale.reference(self.line_reference)
+        self._apply_grayscale_reference()
 
         # --------- ultrasonic init ---------
         trig, echo= ultrasonic_pins
@@ -223,7 +250,7 @@ class Picarx(object):
     def set_grayscale_reference(self, value):
         if isinstance(value, list) and len(value) == 3:
             self.line_reference = value
-            self.grayscale.reference(self.line_reference)
+            self._apply_grayscale_reference()
             self.config_flie.set("line_reference", self.line_reference)
         else:
             raise ValueError("grayscale reference must be a 1*3 list")
@@ -258,6 +285,45 @@ class Picarx(object):
 
 if __name__ == "__main__":
     px = Picarx()
-    px.forward(50)
-    time.sleep(1)
-    px.stop()
+    try:
+        px.forward(50)
+        time.sleep(1)
+        px.stop()
+        time.sleep(0.2)
+
+        px.backward(50)
+        time.sleep(1)
+        px.stop()
+        time.sleep(0.2)
+
+        for angle in range(0, 35):
+            px.set_dir_servo_angle(angle)
+            time.sleep(0.01)
+        for angle in range(35, -35, -1):
+            px.set_dir_servo_angle(angle)
+            time.sleep(0.01)
+        for angle in range(-35, 0):
+            px.set_dir_servo_angle(angle)
+            time.sleep(0.01)
+
+        for angle in range(0, 35):
+            px.set_cam_pan_angle(angle)
+            time.sleep(0.01)
+        for angle in range(35, -35, -1):
+            px.set_cam_pan_angle(angle)
+            time.sleep(0.01)
+        for angle in range(-35, 0):
+            px.set_cam_pan_angle(angle)
+            time.sleep(0.01)
+
+        for angle in range(0, 35):
+            px.set_cam_tilt_angle(angle)
+            time.sleep(0.01)
+        for angle in range(35, -35, -1):
+            px.set_cam_tilt_angle(angle)
+            time.sleep(0.01)
+        for angle in range(-35, 0):
+            px.set_cam_tilt_angle(angle)
+            time.sleep(0.01)
+    finally:
+        px.stop()

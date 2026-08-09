@@ -1,16 +1,39 @@
 # #!/usr/bin/env python3
 
-from robot_hat.utils import reset_mcu
+from pathlib import Path
+import os
+import sys
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        vendor_dir = parent / ".vendor"
+        if vendor_dir.is_dir():
+            sys.path.insert(0, str(vendor_dir))
+        break
+
+
+def _ensure_xdg_runtime_dir():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/picarx-runtime-{os.getuid()}"
+    os.makedirs(runtime_dir, exist_ok=True)
+    os.chmod(runtime_dir, 0o700)
+    os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+
+
+_ensure_xdg_runtime_dir()
+
+from robot_hat import utils
+
 from picarx import Picarx
 from vilib import Vilib
 from time import sleep, time, strftime, localtime
 import readchar
 
-import os
 user = os.getlogin()
 user_home = os.path.expanduser(f'~{user}')
 
-reset_mcu()
+if hasattr(utils, "reset_mcu"):
+    utils.reset_mcu()
 sleep(0.2)
 
 manual = '''

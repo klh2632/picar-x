@@ -12,12 +12,43 @@
         and the background gray value.
 
 '''
+from pathlib import Path
+import sys
+import shutil
+import subprocess
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        vendor_dir = parent / ".vendor"
+        if vendor_dir.is_dir():
+            sys.path.insert(0, str(vendor_dir))
+        break
+
 from picarx import Picarx
 from time import sleep
-from robot_hat import TTS
+try:
+    from robot_hat import TTS
+except ImportError:
+    TTS = None
 
-tts = TTS()
-tts.lang("en-US")
+
+class EspeakTTS:
+    def __init__(self):
+        self.voice = "en-us"
+
+    def lang(self, language):
+        normalized = (language or "en-US").replace("_", "-").lower()
+        self.voice = normalized
+
+    def say(self, words):
+        subprocess.run(["espeak", "-v", self.voice, str(words)], check=False)
+
+tts = TTS() if TTS is not None else (EspeakTTS() if shutil.which("espeak") else None)
+if tts is not None:
+    tts.lang("en-US")
+else:
+    print("No TTS backend found; cliff warning speech is disabled.")
 
 px = Picarx()
 # px = Picarx(grayscale_pins=['A0', 'A1', 'A2'])
@@ -45,7 +76,8 @@ if __name__=='__main__':
                 state = "danger"   
                 px.backward(80)
                 if last_state == "safe":
-                    tts.say("danger")
+                    if tts is not None:
+                        tts.say("danger")
                     sleep(0.1)
             last_state = state
 

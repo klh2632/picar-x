@@ -1,8 +1,14 @@
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from picarx import Picarx
 import time
 
 
 if __name__ == "__main__":
+    px = None
     try:
         # init picarx
         px = Picarx()
@@ -42,7 +48,8 @@ if __name__ == "__main__":
             px.set_cam_tilt_angle(angle)
             time.sleep(0.01)
     finally:
-        px.stop()
-        time.sleep(0.2)
+        if px is not None:
+            px.stop()
+            time.sleep(0.2)
 
 

@@ -1,7 +1,14 @@
 
+from pathlib import Path
+import sys
 from time import sleep
 import random
 from math import sin, cos, pi
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        break
 
 def wave_hands(car):
     car.reset()

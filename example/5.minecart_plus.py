@@ -12,6 +12,14 @@
         and the background gray value.
 
 '''
+from pathlib import Path
+import sys
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        break
+
 from picarx import Picarx
 from time import sleep
 

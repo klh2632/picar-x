@@ -1,15 +1,49 @@
+from pathlib import Path
+import sys
+import shutil
+import subprocess
+
+for parent in Path(__file__).resolve().parents:
+    if (parent / "picarx").is_dir():
+        sys.path.insert(0, str(parent))
+        vendor_dir = parent / ".vendor"
+        if vendor_dir.is_dir():
+            sys.path.insert(0, str(vendor_dir))
+        break
+
 from picarx import Picarx
 from time import sleep
-from robot_hat import Music,TTS
+from robot_hat import Music
 from vilib import Vilib
 import readchar
 import random
 import threading
 
+try:
+    from robot_hat import TTS
+except ImportError:
+    TTS = None
+
+
+class EspeakTTS:
+    def __init__(self):
+        self.voice = "en-us"
+
+    def lang(self, language):
+        normalized = (language or "en-US").replace("_", "-").lower()
+        self.voice = normalized
+
+    def say(self, words):
+        subprocess.run(["espeak", "-v", self.voice, str(words)], check=False)
+
 px = Picarx()
 
 music = Music()
-tts = TTS()
+tts = TTS() if TTS is not None else (EspeakTTS() if shutil.which("espeak") else None)
+if tts is not None:
+    tts.lang("en-US")
+else:
+    print("No TTS backend found; treasure hunt speech is disabled.")
 
 manual = '''
 Press keys on keyboard to control Picar-X!
@@ -28,14 +62,21 @@ def renew_color_detect():
     global color
     color = random.choice(color_list)
     Vilib.color_detect(color)
-    tts.say("Look for " + color)
+    if tts is not None:
+        tts.say("Look for " + color)
 
 key = None
 lock = threading.Lock()
 def key_scan_thread():
     global key
     while True:
-        key_temp = readchar.readkey()
+        try:
+            key_temp = readchar.readkey()
+        except KeyboardInterrupt:
+            with lock:
+                key = 'quit'
+            break
+
         print('\r',end='')
         with lock:
             key = key_temp.lower()
@@ -70,16 +111,18 @@ def main():
 
     sleep(1)
     _key_t = threading.Thread(target=key_scan_thread)
-    _key_t.setDaemon(True)
+    _key_t.daemon = True
     _key_t.start()
 
-    tts.say("game start")
+    if tts is not None:
+        tts.say("game start")
     sleep(0.05)
     renew_color_detect()
     while True:
 
         if Vilib.detect_obj_parameter['color_n']!=0 and Vilib.detect_obj_parameter['color_w']>100:
-            tts.say("will done")
+            if tts is not None:
+                tts.say("will done")
             sleep(0.05)
             renew_color_detect()
 
@@ -90,7 +133,8 @@ def main():
                 px.stop()
                 key =  None
             elif key == 'space':
-                tts.say("Look for " + color)
+                if tts is not None:
+                    tts.say("Look for " + color)
                 key =  None
             elif key == 'quit':
                 _key_t.join()
