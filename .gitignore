@@ -1,3 +1,15 @@
 .vscode/*
 build/*
 bk/
+
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging/build outputs
+dist/
+*.egg-info/
+
+# Local-only tooling and vendored environment content
+.copilot-ignore-me
+.vendor/
