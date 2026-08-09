@@ -6,6 +6,8 @@ import os
 import importlib.util
 import re
 import tempfile
+import atexit
+import signal
 
 PROJECT_ROOT = None
 for parent in Path(__file__).resolve().parents:
@@ -264,6 +266,113 @@ def _create_music_instance(report_errors=True):
 
 
 music = _create_music_instance(report_errors=True)
+fallback_bgm_proc = None
+
+
+def _release_audio_resources():
+    global music, fallback_bgm_proc
+    if music is None:
+        if fallback_bgm_proc is not None:
+            try:
+                fallback_bgm_proc.terminate()
+                fallback_bgm_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    fallback_bgm_proc.kill()
+                except Exception:
+                    pass
+            fallback_bgm_proc = None
+        return
+    try:
+        music.music_stop()
+    except Exception:
+        pass
+    try:
+        mixer = getattr(music, "pygame", None)
+        if mixer is not None and hasattr(mixer, "mixer"):
+            mixer.mixer.quit()
+    except Exception:
+        pass
+    if fallback_bgm_proc is not None:
+        try:
+            fallback_bgm_proc.terminate()
+            fallback_bgm_proc.wait(timeout=1)
+        except Exception:
+            try:
+                fallback_bgm_proc.kill()
+            except Exception:
+                pass
+        fallback_bgm_proc = None
+    music = None
+
+
+def _start_fallback_bgm(music_path: str):
+    card_id = os.environ.get("PICARX_AUDIO_CARD_ID")
+    card_name = os.environ.get("PICARX_AUDIO_CARD_NAME")
+    audio_dev = os.environ.get("PICARX_AUDIODEV") or os.environ.get("AUDIODEV")
+
+    device_candidates = []
+    if audio_dev:
+        device_candidates.append(audio_dev)
+    if card_id:
+        device_candidates.extend([f"plughw:{card_id},0", f"hw:{card_id},0"])
+    if card_name:
+        device_candidates.extend([f"plughw:CARD={card_name},DEV=0", f"hw:CARD={card_name},DEV=0"])
+    device_candidates.append(None)
+
+    unique_devices = []
+    for dev in device_candidates:
+        if dev not in unique_devices:
+            unique_devices.append(dev)
+
+    players = []
+    if shutil.which("mpg123"):
+        for dev in unique_devices:
+            if dev is None:
+                players.append(["mpg123", "-q", "-o", "alsa", music_path])
+            else:
+                players.append(["mpg123", "-q", "-o", "alsa", "-a", dev, music_path])
+    if shutil.which("ffplay"):
+        players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", music_path])
+    if shutil.which("cvlc"):
+        players.append(["cvlc", "--play-and-exit", "--quiet", music_path])
+
+    for cmd in players:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sleep(0.25)
+            if proc.poll() is None:
+                return proc
+        except Exception:
+            continue
+    return None
+
+
+def _stop_fallback_bgm():
+    global fallback_bgm_proc
+    if fallback_bgm_proc is None:
+        return
+    try:
+        fallback_bgm_proc.terminate()
+        fallback_bgm_proc.wait(timeout=1)
+    except Exception:
+        try:
+            fallback_bgm_proc.kill()
+        except Exception:
+            pass
+    fallback_bgm_proc = None
+
+
+atexit.register(_release_audio_resources)
+
+
+def _signal_exit_handler(signum, frame):
+    _release_audio_resources()
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _signal_exit_handler)
+signal.signal(signal.SIGINT, _signal_exit_handler)
 
 if shutil.which("espeak"):
     # Prefer espeak so TTS can be routed to the same ALSA device as music
@@ -283,7 +392,7 @@ Input key to call the function!
 '''
 
 def main():
-    global music
+    global music, fallback_bgm_proc
     print(manual)
 
     flag_bgm = False
@@ -313,7 +422,17 @@ def main():
             key = key.lower()
             if key == "q":
                 if not _ensure_music_ready():
-                    print("Music unavailable: audio mixer is not initialized.")
+                    flag_bgm = not flag_bgm
+                    if flag_bgm:
+                        fallback_bgm_proc = _start_fallback_bgm(str(MUSICS_DIR / 'slow-trail-Ahjay_Stelino.mp3'))
+                        if fallback_bgm_proc is None:
+                            print("Music unavailable: audio mixer is not initialized and no fallback player found.")
+                            flag_bgm = False
+                        else:
+                            print('Play Music (fallback player)')
+                    else:
+                        _stop_fallback_bgm()
+                        print('Stop Music')
                     continue
                 flag_bgm = not flag_bgm
                 if flag_bgm is True:
@@ -362,9 +481,10 @@ def main():
                 else:
                     print("TTS unavailable.")
     except KeyboardInterrupt:
-        if music is not None:
-            music.music_stop()
+        _release_audio_resources()
         print("\nExiting TTS example.")
+    finally:
+        _release_audio_resources()
 
 if __name__ == "__main__":
     main()
