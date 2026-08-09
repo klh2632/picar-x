@@ -292,20 +292,58 @@ class Music:
         init_errors = []
         device_candidates = self._alsa_output_candidates()
         for device in device_candidates:
-            try:
-                kwargs = {} if device is None else {"devicename": device}
-                with _silence_native_stderr():
-                    self.pygame.mixer.init(**kwargs)
-                return
-            except Exception as exc:
-                init_errors.append(f"{device or 'auto'}: {exc}")
+            kwargs = {} if device is None else {"devicename": device}
+            for attempt in range(3):
+                try:
+                    with _silence_native_stderr():
+                        try:
+                            self.pygame.mixer.quit()
+                        except Exception:
+                            pass
+                        self.pygame.mixer.init(**kwargs)
+                    return
+                except Exception as exc:
+                    err_text = str(exc)
+                    if "busy" in err_text.lower() and attempt < 2:
+                        time.sleep(0.25 * (attempt + 1))
+                        continue
+                    init_errors.append(f"{device or 'auto'}: {exc}")
+                    break
 
         error_msg = " | ".join(init_errors)
         raise RuntimeError(f"Unable to initialize audio mixer: {error_msg}")
 
     def _alsa_output_candidates(self):
-        """Build ALSA output device candidates from detected playback cards."""
-        devices = []
+        """Build ALSA output candidates, preferring speaker-oriented cards like HiFiBerry."""
+
+        def _card_priority(card_name: str) -> int:
+            name = (card_name or "").lower()
+            if "hifiberry" in name or "dac" in name:
+                return 0
+            if "usb" in name:
+                return 1
+            if "hdmi" in name:
+                return 9
+            return 5
+
+        devices = [None, "default", "sysdefault", "dmix", "plug:dmix"]
+
+        # Highest priority: explicit runtime overrides from the launcher/app.
+        env_dev = os.environ.get("PICARX_AUDIODEV")
+        env_card_id = os.environ.get("PICARX_AUDIO_CARD_ID")
+        if env_dev:
+            devices.insert(0, env_dev)
+            if env_dev.startswith("plughw:"):
+                devices.insert(1, env_dev.replace("plughw:", "hw:", 1))
+        if env_card_id:
+            devices[0:0] = [
+                f"plughw:{env_card_id},0",
+                f"hw:{env_card_id},0",
+                f"plughw:{env_card_id}",
+                f"hw:{env_card_id}",
+            ]
+
+        cards = []
         try:
             result = subprocess.run(
                 ["aplay", "-l"],
@@ -314,20 +352,42 @@ class Music:
                 stderr=subprocess.DEVNULL,
                 text=True,
             )
-            card_ids = []
+            seen = set()
             for line in result.stdout.splitlines():
-                match = re.search(r"card\s+(\d+):", line)
-                if match:
-                    card_id = match.group(1)
-                    if card_id not in card_ids:
-                        card_ids.append(card_id)
-            for card_id in card_ids:
-                devices.extend([f"plughw:{card_id},0", f"hw:{card_id},0"])
+                # Example: card 2: sndrpihifiberry [RPi-simple], device 0: ...
+                match = re.search(r"card\s+(\d+):\s*([^\s\[]+)", line)
+                if not match:
+                    continue
+                card_id = match.group(1)
+                card_name = match.group(2)
+                key = (card_id, card_name)
+                if key not in seen:
+                    seen.add(key)
+                    cards.append((card_id, card_name))
         except Exception:
             pass
 
-        devices.extend(["default", "sysdefault", None])
-        return devices
+        cards.sort(key=lambda item: _card_priority(item[1]))
+
+        for card_id, _card_name in cards:
+            devices.extend(
+                [
+                    f"plughw:{card_id},0",
+                    f"hw:{card_id},0",
+                    f"plughw:{card_id}",
+                    f"hw:{card_id}",
+                ]
+            )
+
+        # Preserve order while removing duplicates.
+        deduped = []
+        seen_devices = set()
+        for device in devices:
+            if device in seen_devices:
+                continue
+            seen_devices.add(device)
+            deduped.append(device)
+        return deduped
 
     def time_signature(self, top: Optional[int] = None, bottom: Optional[int] = None):
         """
