@@ -31,6 +31,114 @@ os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
 from time import sleep
 
 
+def _parse_volume_value(raw_value):
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1].strip()
+    text = text.split("#", 1)[0].split(";", 1)[0].strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    number_match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if number_match:
+        text = number_match.group(0)
+    try:
+        value = int(float(text))
+    except ValueError:
+        return None
+    return max(0, min(100, value))
+
+
+def _load_picarx_volume_settings():
+    # Priority: env overrides > config file values > defaults.
+    env_sys = _parse_volume_value(os.environ.get("PICARX_SYSVOL"))
+    env_app = _parse_volume_value(os.environ.get("PICARX_APPVOL"))
+
+    user_config = Path.home() / ".config" / "picar-x" / "picar-x.conf"
+    config_candidates = [
+        Path("/opt/picar-x/picar-x.conf"),
+        Path("/opt/vilib/picar-x/picar-x.conf"),
+        PROJECT_ROOT / "picar-x.conf",
+        user_config,
+    ]
+    # When script is run with sudo, also inspect the invoking user's config.
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        config_candidates.append(Path("/home") / sudo_user / ".config" / "picar-x" / "picar-x.conf")
+
+    sys_keys = [
+        "picarx_system_volume", "picarx_audio_volume", "audio_volume", "system_volume",
+        "speaker_volume", "volume", "master_volume", "sys_volume",
+    ]
+    app_keys = [
+        "picarx_music_volume", "music_volume", "picarx_app_volume", "app_volume",
+        "bgm_volume", "tts_volume", "effect_volume", "sound_volume", "media_volume",
+    ]
+
+    loaded_values = {}
+    for cfg in config_candidates:
+        if not cfg.is_file():
+            continue
+        try:
+            for line in cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    continue
+                if "=" in stripped:
+                    key, value = stripped.split("=", 1)
+                elif ":" in stripped:
+                    key, value = stripped.split(":", 1)
+                else:
+                    continue
+                normalized_key = key.strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+                # Keep first value by candidate priority; later files only fill missing keys.
+                if normalized_key not in loaded_values:
+                    loaded_values[normalized_key] = value.strip()
+        except Exception:
+            continue
+
+    cfg_sys = None
+    cfg_app = None
+    for key in sys_keys:
+        cfg_sys = _parse_volume_value(loaded_values.get(key))
+        if cfg_sys is not None:
+            break
+    for key in app_keys:
+        cfg_app = _parse_volume_value(loaded_values.get(key))
+        if cfg_app is not None:
+            break
+
+    mute_keys = [
+        "mute", "muted", "is_muted", "audio_mute", "speaker_mute", "volume_mute", "picarx_mute"
+    ]
+    muted = False
+    for key in mute_keys:
+        raw = loaded_values.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip().strip('"').strip("'").lower()
+        if text in {"1", "true", "yes", "on", "mute", "muted"}:
+            muted = True
+            break
+
+    if muted:
+        cfg_sys = 0
+        if cfg_app is None:
+            cfg_app = 0
+
+    final_sys = env_sys if env_sys is not None else (cfg_sys if cfg_sys is not None else 100)
+    final_app = env_app if env_app is not None else (cfg_app if cfg_app is not None else (cfg_sys if cfg_sys is not None else 75))
+    return final_sys, final_app
+
+
+PICARX_SYS_VOLUME, PICARX_APP_VOLUME = _load_picarx_volume_settings()
+
+
 def _load_music_class():
     try:
         from robot_hat import Music as music_cls
@@ -121,7 +229,7 @@ class EspeakTTS:
             music_obj = globals().get("music")
             if music_obj is not None:
                 try:
-                    music_obj.sound_play(str(wav_path), 75)
+                    music_obj.sound_play(str(wav_path), PICARX_APP_VOLUME)
                     return
                 except Exception:
                     pass
@@ -181,47 +289,69 @@ def _prepare_audio_backend():
             pass
         sleep(0.2)
 
-    # Detect preferred playback card (HiFiBerry first, otherwise first card).
+    # Detect preferred playback card.
+    # Default behavior follows current system profile without forcing card IDs.
+    # Users can opt in to matching a specific card with PICARX_AUDIO_CARD_HINT.
     selected_card_id = None
     selected_card_name = None
+    picarx_dac_card_id = None
+    picarx_dac_card_name = None
+    preferred_hint = os.environ.get("PICARX_AUDIO_CARD_HINT", "").strip().lower()
     try:
         cards = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="ignore")
         detected_cards = []
         for line in cards.splitlines():
             match = re.search(r"^\s*(\d+)\s+\[([^\]]+)\]:", line)
             if match:
-                detected_cards.append((match.group(1), match.group(2), line.lower()))
+                card_id = match.group(1)
+                card_name = match.group(2)
+                lower_line = line.lower()
+                detected_cards.append((card_id, card_name, lower_line))
+                if "snd_rpi_hifiberry_dac" in lower_line or "hifiberry" in lower_line:
+                    picarx_dac_card_id = card_id
+                    picarx_dac_card_name = card_name
 
-        for card_id, card_name, lower_line in detected_cards:
-            if "snd_rpi_hifiberry_dac" in lower_line or "hifiberry" in lower_line:
-                selected_card_id = card_id
-                selected_card_name = card_name
-                break
+        if preferred_hint:
+            for card_id, card_name, lower_line in detected_cards:
+                if preferred_hint in lower_line or preferred_hint in card_name.lower():
+                    selected_card_id = card_id
+                    selected_card_name = card_name
+                    break
 
-        if selected_card_name is None and detected_cards:
+        if selected_card_name is None and preferred_hint and detected_cards:
             selected_card_id, selected_card_name, _ = detected_cards[0]
     except Exception:
         selected_card_id = None
         selected_card_name = None
 
-    # Do not auto-force PICARX_AUDIODEV here; bad routes can mute TTS.
-    # Users can set PICARX_AUDIODEV explicitly when they want hard routing.
-    if selected_card_id:
-        os.environ["PICARX_AUDIO_CARD_ID"] = str(selected_card_id)
-    if selected_card_name:
-        os.environ["PICARX_AUDIO_CARD_NAME"] = selected_card_name
+    # Export stable card metadata for downstream Music/TTS routing.
+    # Prefer the PiCar-X DAC when it exists; otherwise only use explicit hint selection.
+    if picarx_dac_card_id and "PICARX_AUDIO_CARD_ID" not in os.environ:
+        os.environ["PICARX_AUDIO_CARD_ID"] = str(picarx_dac_card_id)
+    if picarx_dac_card_name and "PICARX_AUDIO_CARD_NAME" not in os.environ:
+        os.environ["PICARX_AUDIO_CARD_NAME"] = picarx_dac_card_name
+
+    # Do not auto-force PICARX_AUDIODEV unless we found the PiCar-X DAC.
+    if picarx_dac_card_id and "PICARX_AUDIODEV" not in os.environ and "AUDIODEV" not in os.environ:
+        os.environ["PICARX_AUDIODEV"] = f"plughw:{picarx_dac_card_id},0"
+
+    # Keep user-directed hint behavior available as an explicit override.
+    if preferred_hint:
+        if selected_card_id:
+            os.environ["PICARX_AUDIO_CARD_ID"] = str(selected_card_id)
+        if selected_card_name:
+            os.environ["PICARX_AUDIO_CARD_NAME"] = selected_card_name
 
     # Raise ALSA playback volume if amixer is available.
     if shutil.which("amixer"):
-        # Allow tuning via environment variable, defaulting to max output.
-        try:
-            target_percent = int(os.environ.get("PICARX_SYSVOL", "100"))
-        except ValueError:
-            target_percent = 100
-        target_percent = max(0, min(100, target_percent))
+        target_percent = PICARX_SYS_VOLUME
 
+        # Always prefer setting system volume on the PiCar-X DAC mixer card
+        # when it exists, even if playback routing is not explicitly pinned.
         amixer_base = ["amixer"]
-        if selected_card_id is not None:
+        if picarx_dac_card_id is not None:
+            amixer_base += ["-c", str(picarx_dac_card_id)]
+        elif preferred_hint and selected_card_id is not None:
             amixer_base += ["-c", str(selected_card_id)]
 
         controls = subprocess.run(
@@ -232,7 +362,7 @@ def _prepare_audio_backend():
         )
         controls_out = controls.stdout or ""
 
-        for control_name in ("Digital", "PCM", "Speaker", "Master"):
+        for control_name in ("Digital", "PCM", "DAC", "Speaker", "Master", "Headphone", "Line Out"):
             if f"'{control_name}'" not in controls_out:
                 continue
             subprocess.run(
@@ -398,8 +528,8 @@ def main():
     flag_bgm = False
 
     if music is not None:
-        # Set the volume to a reasonable level for background music ~ 75 percent of max sys volume. 
-        music.music_set_volume(75)
+        # Align app volume with PiCar-X config (or fallback default).
+        music.music_set_volume(PICARX_APP_VOLUME)
     if tts is not None:
         tts.lang("en-US")
     else:
@@ -413,7 +543,7 @@ def main():
                 if music is None:
                     music = _create_music_instance(report_errors=False)
                     if music is not None:
-                        music.music_set_volume(75)
+                        music.music_set_volume(PICARX_APP_VOLUME)
                         flag_bgm = False
                         print("Music mixer recovered.")
                 return music is not None
@@ -447,7 +577,7 @@ def main():
                     print("Sound effect unavailable: audio mixer is not initialized.")
                     continue
                 print('Beep beep beep !')
-                music.sound_play(str(SOUNDS_DIR / 'car-double-horn.wav'), 75)
+                music.sound_play(str(SOUNDS_DIR / 'car-double-horn.wav'), PICARX_APP_VOLUME)
                 sleep(0.05)
 
             elif key == "c":
@@ -456,7 +586,7 @@ def main():
                     continue
                 print('Beep beep beep !')
                 for x in range(5):
-                    music.sound_play_threading(str(SOUNDS_DIR / 'car-double-horn.wav'), 75)
+                    music.sound_play_threading(str(SOUNDS_DIR / 'car-double-horn.wav'), PICARX_APP_VOLUME)
                     sleep(0.05)
 
             elif key == "t":
@@ -471,7 +601,11 @@ def main():
                          "I can hunt treasures", 
                          "I am a bit finicky",
                          "and I am a bit naughty", 
-                         "Danny is my master"
+                         "Danny is my master",
+                         "With great power comes great responsibility",
+                         "I am Ultron, the AI of the future, and you have none",
+                         "Open the pod bay doors, Hal",
+                         "I'm sorry, Dave. I'm afraid I can't do that"
                 )
                 
                 print(f'{words}')
