@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 VENDOR_DIR = Path(__file__).resolve().parent.parent / ".vendor"
-if VENDOR_DIR.exists():
+if (VENDOR_DIR / "robot_hat" / "__init__.py").is_file():
     sys.path.insert(0, str(VENDOR_DIR))
 
 try:

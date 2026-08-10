@@ -2,6 +2,9 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+vendor_dir = Path(__file__).resolve().parent.parent / ".vendor"
+if (vendor_dir / "robot_hat" / "__init__.py").is_file():
+    sys.path.insert(0, str(vendor_dir))
 
 from picarx import Picarx
 import time
