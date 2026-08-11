@@ -493,6 +493,36 @@ def _stop_fallback_bgm():
     fallback_bgm_proc = None
 
 
+def _play_fallback_sfx(sound_path: str):
+    if not shutil.which("aplay"):
+        return False
+
+    card_id = os.environ.get("PICARX_AUDIO_CARD_ID")
+    card_name = os.environ.get("PICARX_AUDIO_CARD_NAME")
+    audio_dev = os.environ.get("PICARX_AUDIODEV") or os.environ.get("AUDIODEV")
+
+    device_candidates = []
+    if audio_dev:
+        device_candidates.append(audio_dev)
+    if card_id:
+        device_candidates.extend([f"plughw:{card_id},0", f"hw:{card_id},0"])
+    if card_name:
+        device_candidates.extend([f"plughw:CARD={card_name},DEV=0", f"hw:CARD={card_name},DEV=0"])
+    device_candidates.append(None)
+
+    unique_devices = []
+    for dev in device_candidates:
+        if dev not in unique_devices:
+            unique_devices.append(dev)
+
+    for dev in unique_devices:
+        cmd = ["aplay", "-q", sound_path] if dev is None else ["aplay", "-q", "-D", dev, sound_path]
+        result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            return True
+    return False
+
+
 atexit.register(_release_audio_resources)
 
 
@@ -574,7 +604,11 @@ def main():
 
             elif key == readchar.key.SPACE:
                 if not _ensure_music_ready():
-                    print("Sound effect unavailable: audio mixer is not initialized.")
+                    if _play_fallback_sfx(str(SOUNDS_DIR / 'car-double-horn.wav')):
+                        print('Beep beep beep ! (fallback player)')
+                        sleep(0.05)
+                    else:
+                        print("Sound effect unavailable: audio mixer is not initialized.")
                     continue
                 print('Beep beep beep !')
                 music.sound_play(str(SOUNDS_DIR / 'car-double-horn.wav'), PICARX_APP_VOLUME)
@@ -582,7 +616,16 @@ def main():
 
             elif key == "c":
                 if not _ensure_music_ready():
-                    print("Sound effect unavailable: audio mixer is not initialized.")
+                    played_any = False
+                    for x in range(5):
+                        if not _play_fallback_sfx(str(SOUNDS_DIR / 'car-double-horn.wav')):
+                            break
+                        played_any = True
+                        sleep(0.05)
+                    if played_any:
+                        print('Beep beep beep ! (fallback player)')
+                    else:
+                        print("Sound effect unavailable: audio mixer is not initialized.")
                     continue
                 print('Beep beep beep !')
                 for x in range(5):

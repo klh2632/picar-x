@@ -8,7 +8,30 @@ for parent in Path(__file__).resolve().parents:
 
 from picarx import Picarx
 from time import sleep
-import readchar
+
+try:
+    import readchar
+except ImportError:
+    class _ReadCharFallbackKey:
+        CTRL_C = "\x03"
+
+    class _ReadCharFallback:
+        key = _ReadCharFallbackKey()
+
+        @staticmethod
+        def readkey():
+            import tty
+            import termios
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    readchar = _ReadCharFallback()
 
 manual = '''
 Press keys on keyboard to control PiCar-X!
@@ -29,6 +52,7 @@ def show_info():
 
 
 if __name__ == "__main__":
+    px = None
     try:
         pan_angle = 0
         tilt_angle = 0
@@ -78,10 +102,11 @@ if __name__ == "__main__":
                 break
 
     finally:
-        px.set_cam_tilt_angle(0)
-        px.set_cam_pan_angle(0)  
-        px.set_dir_servo_angle(0)  
-        px.stop()
-        sleep(.2)
+        if px is not None:
+            px.set_cam_tilt_angle(0)
+            px.set_cam_pan_angle(0)
+            px.set_dir_servo_angle(0)
+            px.stop()
+            sleep(.2)
 
 
