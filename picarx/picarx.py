@@ -1,17 +1,40 @@
 import os
 import sys
 from pathlib import Path
+import types
 
 VENDOR_DIR = Path(__file__).resolve().parent.parent / ".vendor"
 if (VENDOR_DIR / "robot_hat" / "__init__.py").is_file():
     sys.path.insert(0, str(VENDOR_DIR))
 
+SITE_PACKAGES_311 = Path("/usr/local/lib/python3.11/site-packages")
+if SITE_PACKAGES_311.is_dir():
+    sys.path.insert(0, str(SITE_PACKAGES_311))
+
+if "pyaudio" not in sys.modules:
+    _pyaudio_stub = types.ModuleType("pyaudio")
+    _pyaudio_stub.paInt16 = 8
+    _pyaudio_stub.PyAudio = object
+    _pyaudio_portaudio_stub = types.ModuleType("pyaudio._portaudio")
+    sys.modules["pyaudio"] = _pyaudio_stub
+    sys.modules["pyaudio._portaudio"] = _pyaudio_portaudio_stub
+
 try:
-    from robot_hat import Pin, ADC, PWM, Servo, fileDB
-    from robot_hat import Grayscale_Module, Ultrasonic, utils
+    from robot_hat.pin import Pin
+    from robot_hat.adc import ADC
+    from robot_hat.pwm import PWM
+    from robot_hat.servo import Servo
+    from robot_hat.filedb import fileDB
+    from robot_hat.modules import Grayscale_Module, Ultrasonic
+    from robot_hat import utils
 except ImportError:
-    from robot_hat import Pin, ADC, PWM, Servo, FileDB as fileDB
-    from robot_hat import Grayscale as Grayscale_Module, Ultrasonic, utils
+    from robot_hat.pin import Pin
+    from robot_hat.adc import ADC
+    from robot_hat.pwm import PWM
+    from robot_hat.servo import Servo
+    from robot_hat.filedb import fileDB
+    from robot_hat.modules import Grayscale_Module, Ultrasonic
+    from robot_hat import utils
 import time
 
 

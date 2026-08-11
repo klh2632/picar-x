@@ -1,5 +1,32 @@
+#!/usr/bin/python3
 from pathlib import Path
 import sys
+
+try:
+    import readchar
+except ImportError:
+    class _ReadCharFallbackKey:
+        SPACE = " "
+        CTRL_C = "\x03"
+        ESC = "\x1b"
+
+    class _ReadCharFallback:
+        key = _ReadCharFallbackKey()
+
+        @staticmethod
+        def readkey():
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    readchar = _ReadCharFallback()
 
 for parent in Path(__file__).resolve().parents:
     if (parent / "picarx").is_dir():
@@ -9,7 +36,6 @@ for parent in Path(__file__).resolve().parents:
 from picarx import Picarx
 import time
 import threading
-import readchar 
 import os
 
 px = Picarx()

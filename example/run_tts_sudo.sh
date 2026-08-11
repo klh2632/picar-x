@@ -18,4 +18,4 @@ if [[ -n "$HIFIBERRY_CARD_ID" ]]; then
 	EXTRA_ENV+=("PICARX_AUDIO_CARD_HINT=snd_rpi_hifiberry_dac")
 fi
 
-exec sudo -E env "${EXTRA_ENV[@]}" /usr/bin/python "$SCRIPT_DIR/3.tts_example.py"
+exec sudo -E env "${EXTRA_ENV[@]}" /usr/bin/python3 "$SCRIPT_DIR/3.tts_example.py"
