@@ -50,6 +50,8 @@ if __name__ == "__main__":
         for angle in range(-35, 0):
             px.set_cam_tilt_angle(angle)
             time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
     finally:
         if px is not None:
             px.stop()

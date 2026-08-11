@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 import shutil
 import subprocess
+import os
 
 for parent in Path(__file__).resolve().parents:
     if (parent / "picarx").is_dir():
@@ -24,6 +25,30 @@ for parent in Path(__file__).resolve().parents:
         if vendor_dir.is_dir():
             sys.path.insert(0, str(vendor_dir))
         break
+
+
+def _handoff_to_system_python():
+    target_python = Path("/usr/bin/python3")
+    handoff_env = "PICARX_PY313_HANDOFF"
+    if not target_python.exists():
+        return
+    if os.geteuid() != 0:
+        return
+    if os.environ.get(handoff_env) == "1":
+        return
+    if Path(sys.executable).resolve() == target_python.resolve():
+        return
+
+    env = dict(os.environ)
+    env[handoff_env] = "1"
+    os.execvpe(
+        str(target_python),
+        [str(target_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        env,
+    )
+
+
+_handoff_to_system_python()
 
 from picarx import Picarx
 from time import sleep
@@ -80,6 +105,8 @@ if __name__=='__main__':
                         tts.say("danger")
                     sleep(0.1)
             last_state = state
+    except KeyboardInterrupt:
+        pass
 
     finally:
         px.stop()

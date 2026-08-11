@@ -33,6 +33,8 @@ def main():
                 px.set_dir_servo_angle(-30)
                 px.backward(POWER)
                 time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
 
     finally:
         px.forward(0)

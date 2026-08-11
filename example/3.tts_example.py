@@ -171,6 +171,7 @@ try:
 except ImportError:
     class _ReadCharFallbackKey:
         SPACE = " "
+        CTRL_C = "\x03"
 
     class _ReadCharFallback:
         key = _ReadCharFallbackKey()
@@ -579,6 +580,8 @@ def main():
                 return music is not None
 
             key = readchar.readkey()
+            if key == getattr(readchar.key, "CTRL_C", "\x03") or key == "\x03":
+                raise KeyboardInterrupt
             key = key.lower()
             if key == "q":
                 if not _ensure_music_ready():

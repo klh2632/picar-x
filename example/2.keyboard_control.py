@@ -100,6 +100,8 @@ if __name__ == "__main__":
             elif key == readchar.key.CTRL_C:
                 print("\n Quit")
                 break
+    except KeyboardInterrupt:
+        pass
 
     finally:
         if px is not None:
