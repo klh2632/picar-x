@@ -19,6 +19,49 @@ if "pyaudio" not in sys.modules:
     sys.modules["pyaudio"] = _pyaudio_stub
     sys.modules["pyaudio._portaudio"] = _pyaudio_portaudio_stub
 
+# Keep the old Picar-X import schema working against current robot_hat releases.
+for legacy_name, target_name in {
+    "robot_hat.adc": "robot_hat.drivers.adc.sunfounder_adc",
+    "robot_hat.pwm": "robot_hat.sunfounder.pwm",
+    "robot_hat.servo": "robot_hat.sunfounder.sunfounder_servo",
+    "robot_hat.filedb": "robot_hat.filedb",
+}.items():
+    if legacy_name not in sys.modules:
+        try:
+            sys.modules[legacy_name] = __import__(target_name, fromlist=['*'])
+        except Exception:
+            pass
+
+try:
+    from robot_hat.filedb import FileDB as _FileDB
+    if not hasattr(sys.modules["robot_hat.filedb"], "fileDB"):
+        sys.modules["robot_hat.filedb"].fileDB = _FileDB
+except Exception:
+    pass
+
+if "robot_hat.modules" not in sys.modules:
+    try:
+        from robot_hat.sunfounder.grayscale import Grayscale as Grayscale_Module
+    except Exception:
+        Grayscale_Module = None
+    try:
+        from robot_hat.sensors.ultrasonic import Ultrasonic
+    except Exception:
+        try:
+            from robot_hat.sensors.ultrasonic.HC_SR04 import Ultrasonic
+        except Exception:
+            class Ultrasonic:
+                def __init__(self, *args, **kwargs):
+                    self.args = args
+                    self.kwargs = kwargs
+
+                def read(self, *args, **kwargs):
+                    return -1
+    legacy_modules = types.ModuleType("robot_hat.modules")
+    legacy_modules.Grayscale_Module = Grayscale_Module
+    legacy_modules.Ultrasonic = Ultrasonic
+    sys.modules["robot_hat.modules"] = legacy_modules
+
 try:
     from robot_hat.pin import Pin
     from robot_hat.adc import ADC
@@ -120,7 +163,11 @@ class Picarx(object):
         # get calibration values
         self.cali_dir_value = self.config_flie.get("picarx_dir_motor", default_value="[1, 1]")
         self.cali_dir_value = [int(i.strip()) for i in self.cali_dir_value.strip().strip("[]").split(",")]
-        self.cali_speed_value = [0, 0]
+        self.cali_speed_value = self.config_flie.get("picarx_speed_motor", default_value="[0, 0]")
+        try:
+            self.cali_speed_value = [int(i.strip()) for i in self.cali_speed_value.strip().strip("[]").split(",")]
+        except Exception:
+            self.cali_speed_value = [0, 0]
         self.dir_current_angle = 0
         # init pwm
         for pin in self.motor_speed_pins:
@@ -168,14 +215,23 @@ class Picarx(object):
             self.motor_direction_pins[motor].low()
             self.motor_speed_pins[motor].pulse_width_percent(speed)
 
+    def set_motor_speed_calibration(self, value):
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            self.cali_speed_value = [int(v) for v in value]
+            self.config_flie.set("picarx_speed_motor", self.cali_speed_value)
+            return self.cali_speed_value
+        raise ValueError("motor speed calibration must be a 2-item list/tuple")
+
+    def set_single_motor_speed_calibration(self, motor, value):
+        motor -= 1
+        if motor not in (0, 1):
+            raise ValueError("motor index must be 1 (left) or 2 (right)")
+        trim = list(self.cali_speed_value)
+        trim[motor] = int(value)
+        return self.set_motor_speed_calibration(trim)
+
     def motor_speed_calibration(self, value):
-        self.cali_speed_value = value
-        if value < 0:
-            self.cali_speed_value[0] = 0
-            self.cali_speed_value[1] = abs(self.cali_speed_value)
-        else:
-            self.cali_speed_value[0] = abs(self.cali_speed_value)
-            self.cali_speed_value[1] = 0
+        self.set_motor_speed_calibration([value, value])
 
     def motor_direction_calibrate(self, motor, value):
         ''' set motor direction calibration value

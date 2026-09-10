@@ -46,7 +46,10 @@ manual = '''
     [4]: left motor                 [Q]: change motor direction
     [5]: right motor                [E]: motors run/stop
 
-    [SPACE]: confirm calibration                [Crtl+C]: quit
+    [M]: switch mode                [W/S]: trim selected motor in motor mode
+    [SPACE]: confirm calibration     [Crtl+C]: quit
+
+    Note: trim acts immediately when the motors are running.
                                       
 '''    
 
@@ -55,10 +58,12 @@ px_power = 30
 
 servo_num = 0
 motor_num = 0
+edit_mode = 'servo'
 servo_names = ['direction servo', 'camera pan servo', 'camera tilt servo']
 motor_names = ['left motor', 'right motor']
 servos_cali = [px.dir_cali_val, px.cam_pan_cali_val, px.cam_tilt_cali_val]
 motors_cali = px.cali_dir_value
+motors_speed_trim = list.copy(px.cali_speed_value)
 servos_offset = list.copy(servos_cali)
 motors_offset = list.copy(motors_cali)
 
@@ -106,15 +111,16 @@ def servos_reset():
 def show_info():
     print("\033[H\033[J", end='')  # clear terminal windows
     print(manual)
-    print('[ %s ] [ %s ]'%(servo_names[servo_num], motor_names[motor_num])) 
-    print('offset: %s, %s'%(servos_offset, motors_offset))
+    print('[ %s ] [ %s ] [mode: %s]'%(servo_names[servo_num], motor_names[motor_num], edit_mode))
+    print('servo offset: %s, motor direction: %s, motor trim: %s'%(servos_offset, motors_offset, motors_speed_trim))
 
 
 def cali_helper(): 
-    global servo_num, motor_num
-    global servos_cali, motors_cali, servos_offset, motors_offset
+    global servo_num, motor_num, edit_mode
+    global servos_cali, motors_cali, servos_offset, motors_offset, motors_speed_trim
     motor_run = False
     step = 0.4
+    trim_step = 2
     # step = (180 / 2000) * (20000 / 4095)  # actual precision of steering gear
 
     # reset
@@ -127,17 +133,20 @@ def cali_helper():
         # readkey
         key = readchar.readkey()
         key = key.lower()
+        if key == 'm':
+            edit_mode = 'motor' if edit_mode == 'servo' else 'servo'
+            show_info()
         # select the servo 
-        if key in ('123'):
+        elif key in ('123'):
             servo_num = int(key)-1
+            edit_mode = 'servo'
             show_info()
-        if key in ('45'):
+        elif key in ('45'):
             motor_num = int(key)-4
+            edit_mode = 'motor'
             show_info()
-        # servos move
-        elif key == 'r':
-            servos_test()
-        elif key == 'w' or key == 'd':
+        # servo adjustments
+        elif edit_mode == 'servo' and (key == 'w' or key == 'd'):
             servos_offset[servo_num] += step
             if servos_offset[servo_num] > 20:
                 servos_offset[servo_num] =20
@@ -145,7 +154,7 @@ def cali_helper():
             show_info()
             set_servos_offset(servo_num, servos_offset[servo_num])
             servos_move(servo_num, 0)
-        elif key == 's' or key == 'a':
+        elif edit_mode == 'servo' and (key == 's' or key == 'a'):
             servos_offset[servo_num] -= step
             if servos_offset[servo_num] < -20:
                 servos_offset[servo_num] = -20
@@ -153,6 +162,25 @@ def cali_helper():
             show_info()
             set_servos_offset(servo_num, servos_offset[servo_num])
             servos_move(servo_num, 0)
+        # motor trim adjustments
+        elif edit_mode == 'motor' and key == 'w':
+            motors_speed_trim[motor_num] += trim_step
+            if motors_speed_trim[motor_num] > 50:
+                motors_speed_trim[motor_num] = 50
+            px.set_single_motor_speed_calibration(motor_num + 1, motors_speed_trim[motor_num])
+            if not motor_run:
+                motor_run = True
+            px.forward(px_power)
+            show_info()
+        elif edit_mode == 'motor' and key == 's':
+            motors_speed_trim[motor_num] -= trim_step
+            if motors_speed_trim[motor_num] < -50:
+                motors_speed_trim[motor_num] = -50
+            px.set_single_motor_speed_calibration(motor_num + 1, motors_speed_trim[motor_num])
+            if not motor_run:
+                motor_run = True
+            px.forward(px_power)
+            show_info()
         # motors move
         elif key == 'q': 
             motors_offset[motor_num] = -1 * motors_offset[motor_num]
@@ -178,8 +206,10 @@ def cali_helper():
                     px.cam_pan_servo_calibrate(servos_offset[1])
                     px.cam_tilt_servo_calibrate(servos_offset[2])
                     px.motor_direction_calibrate(motor_num +1 , motors_offset[motor_num])
+                    px.set_motor_speed_calibration(motors_speed_trim)
                     sleep(0.2)
                     servos_offset = [px.dir_cali_val, px.cam_pan_cali_val, px.cam_tilt_cali_val]
+                    motors_speed_trim = list.copy(px.cali_speed_value)
                     show_info()
                     print('The calibration value has been saved.')
                     break

@@ -1,7 +1,9 @@
-from openai import OpenAI
-import time
-import shutil
+import base64
 import os
+import shutil
+import time
+
+from openai import OpenAI
 
 # utils
 # =================================================================
@@ -49,17 +51,58 @@ class OpenAiHelper():
     TTS_OUTPUT_FILE = 'tts_output.mp3'
     TIMEOUT = 30 # seconds
 
-    def __init__(self, api_key, assistant_id, assistant_name, timeout=TIMEOUT) -> None:
-        
+    def __init__(self, api_key, assistant_id, assistant_name, timeout=TIMEOUT, model="gpt-4o") -> None:
         self.api_key = api_key
         self.assistant_id = assistant_id
         self.assistant_name = assistant_name
+        self.model = model
 
         self.client = OpenAI(api_key=api_key, timeout=timeout)
-        self.thread = self.client.beta.threads.create()
-        self.run = self.client.beta.threads.runs.create_and_poll(
-            thread_id=self.thread.id,
-            assistant_id=assistant_id,
+
+    def _extract_text(self, response):
+        if hasattr(response, "output_text") and response.output_text:
+            return response.output_text
+
+        texts = []
+        output = getattr(response, "output", []) or []
+        for item in output:
+            blocks = item.get("content") if isinstance(item, dict) else getattr(item, "content", [])
+            for block in blocks:
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    text_value = block.get("text")
+                else:
+                    block_type = getattr(block, "type", None)
+                    text_value = getattr(block, "text", None)
+
+                if block_type in {"output_text", "text"} and text_value:
+                    texts.append(text_value)
+
+        if texts:
+            return "\n".join(texts).strip()
+        return ""
+
+    def _response(self, message, image_path=None):
+        if image_path:
+            with open(image_path, "rb") as image_file:
+                encoded = base64.b64encode(image_file.read()).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{encoded}"
+            payload = {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": message},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        else:
+            payload = {
+                "role": "user",
+                "content": [{"type": "input_text", "text": message}],
+            }
+
+        return self.client.responses.create(
+            model=self.model,
+            input=[payload],
         )
 
     def stt(self, audio, language='en'):
@@ -119,85 +162,31 @@ class OpenAiHelper():
 
     def dialogue(self, msg):
         chat_print("user", msg)
-        message = self.client.beta.threads.messages.create(
-            thread_id=self.thread.id,
-            role="user",
-            content=msg
-            )
-        run = self.client.beta.threads.runs.create_and_poll(
-            thread_id=self.thread.id,
-            assistant_id=self.assistant_id,
-        )
-        if run.status == 'completed': 
-            messages = self.client.beta.threads.messages.list(
-                thread_id=self.thread.id
-            )
-
-            for message in messages.data:
-                if message.role == 'assistant':
-                    for block in message.content:
-                        if block.type == 'text':
-                            value = block.text.value
-                            chat_print(self.assistant_name, value)
-                            try:
-                                value = eval(value) # convert to dict
-                                return value
-                            except Exception as e:
-                                return str(value)
-                break # only last reply
-        else:
-            print(run.status)
-
+        try:
+            response = self._response(msg)
+            value = self._extract_text(response)
+            chat_print(self.assistant_name, value)
+            try:
+                return eval(value)
+            except Exception:
+                return str(value)
+        except Exception as exc:
+            print(f"dialogue err: {exc}")
+            return False
 
     def dialogue_with_img(self, msg, img_path):
-        chat_print(f"user", msg)
-
-        img_file = self.client.files.create(
-                    file=open(img_path, "rb"),
-                    purpose="vision"
-                )
-
-        message =  self.client.beta.threads.messages.create(
-            thread_id= self.thread.id,
-            role="user",
-            content= [
-                {
-                    "type": "text",
-                    "text": msg
-                },
-                # {
-                # "type": "image_url",
-                # "image_url": {"url": "https://example.com/image.png"}
-                # },
-                {
-                    "type": "image_file",
-                    "image_file": {"file_id": img_file.id}
-                }
-            ],
-            )
-        run = self.client.beta.threads.runs.create_and_poll(
-            thread_id=self.thread.id,
-            assistant_id=self.assistant_id,
-        )
-        if run.status == 'completed': 
-            messages = self.client.beta.threads.messages.list(
-                thread_id=self.thread.id
-            )
-
-            for message in messages.data:
-                if message.role == 'assistant':
-                    for block in message.content:
-                        if block.type == 'text':
-                            value = block.text.value
-                            chat_print(self.assistant_name, value)
-                            try:
-                                value = eval(value) # convert to dict
-                                return value
-                            except Exception as e:
-                                return str(value)
-                break # only last reply
-        else:
-            print(run.status)
+        chat_print("user", msg)
+        try:
+            response = self._response(msg, image_path=img_path)
+            value = self._extract_text(response)
+            chat_print(self.assistant_name, value)
+            try:
+                return eval(value)
+            except Exception:
+                return str(value)
+        except Exception as exc:
+            print(f"dialogue_with_img err: {exc}")
+            return False
 
 
     def text_to_speech(self, text, output_file, voice='alloy', response_format="mp3", speed=1, instructions=''):

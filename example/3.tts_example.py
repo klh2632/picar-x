@@ -388,7 +388,7 @@ def _create_music_instance(report_errors=True):
             last_exc = exc
             # Re-probe ALSA route and retry, especially helpful for transient busy states.
             _prepare_audio_backend()
-            sleep(0.5)
+            sleep(0.25)
 
     if report_errors and last_exc is not None:
         print(f"Audio mixer unavailable: {last_exc}")
@@ -400,18 +400,32 @@ music = _create_music_instance(report_errors=True)
 fallback_bgm_proc = None
 
 
+def _safe_stop_process(proc):
+    if proc is None:
+        return
+    if not hasattr(proc, "terminate"):
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    if hasattr(proc, "wait"):
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+    if hasattr(proc, "kill"):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _release_audio_resources():
     global music, fallback_bgm_proc
     if music is None:
         if fallback_bgm_proc is not None:
-            try:
-                fallback_bgm_proc.terminate()
-                fallback_bgm_proc.wait(timeout=1)
-            except Exception:
-                try:
-                    fallback_bgm_proc.kill()
-                except Exception:
-                    pass
+            _safe_stop_process(fallback_bgm_proc)
             fallback_bgm_proc = None
         return
     try:
@@ -425,14 +439,7 @@ def _release_audio_resources():
     except Exception:
         pass
     if fallback_bgm_proc is not None:
-        try:
-            fallback_bgm_proc.terminate()
-            fallback_bgm_proc.wait(timeout=1)
-        except Exception:
-            try:
-                fallback_bgm_proc.kill()
-            except Exception:
-                pass
+        _safe_stop_process(fallback_bgm_proc)
         fallback_bgm_proc = None
     music = None
 
@@ -483,14 +490,7 @@ def _stop_fallback_bgm():
     global fallback_bgm_proc
     if fallback_bgm_proc is None:
         return
-    try:
-        fallback_bgm_proc.terminate()
-        fallback_bgm_proc.wait(timeout=1)
-    except Exception:
-        try:
-            fallback_bgm_proc.kill()
-        except Exception:
-            pass
+    _safe_stop_process(fallback_bgm_proc)
     fallback_bgm_proc = None
 
 

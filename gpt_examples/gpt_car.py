@@ -1,19 +1,179 @@
+import os
+
 from openai_helper import OpenAiHelper
-from keys import OPENAI_API_KEY, OPENAI_ASSISTANT_ID
+from keys import (
+    OPENAI_API_KEY,
+    OPENAI_ASSISTANT_ID,
+    OPENAI_ASSISTANT_NAME,
+    OPENAI_ASSISTANT_MODEL,
+)
 from preset_actions import *
 from utils import *
 
 import readline # optimize keyboard input, only need to import
 
+try:
+    import readchar
+except ImportError:
+    class _ReadCharFallbackKey:
+        CTRL_C = "\x03"
+
+    class _ReadCharFallback:
+        key = _ReadCharFallbackKey()
+
+        @staticmethod
+        def readkey():
+            import tty
+            import termios
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    readchar = _ReadCharFallback()
+
 import speech_recognition as sr
 
 from pathlib import Path
 import sys
+import subprocess
+import signal
 
 for parent in Path(__file__).resolve().parents:
     if (parent / "picarx").is_dir():
         sys.path.insert(0, str(parent))
+        sibling_vilib_root = parent.parent
+        if sibling_vilib_root.is_dir():
+            sys.path.insert(0, str(sibling_vilib_root))
         break
+
+
+def _purge_legacy_python311_paths():
+    legacy_paths = {
+        "/usr/local/lib/python3.11",
+        "/usr/local/lib/python3.11/site-packages",
+        "/usr/local/lib/python3.11/dist-packages",
+    }
+    sys.path[:] = [p for p in sys.path if p and p not in legacy_paths and "python3.11" not in p]
+
+
+def _add_vilib_dependency_paths():
+    for dep_path in (
+        "/usr/lib/python3/dist-packages",
+        "/usr/lib/python3.11/dist-packages",
+        "/usr/lib/aarch64-linux-gnu/python3.11/dist-packages",
+    ):
+        p = Path(dep_path)
+        if p.is_dir() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+
+
+def _cleanup_orphan_camera_processes():
+    if os.environ.get("PICARX_AUTO_CLEAN_CAMERA", "1") != "1":
+        return
+    if os.geteuid() != 0:
+        return
+
+    script_markers = (
+        "7.display.py",
+        "8.stare_at_you.py",
+        "9.record_video.py",
+        "10.bull_fight.py",
+        "11.video_car.py",
+        "12.treasure_hunt.py",
+        "13.app_control.py",
+        "gpt_car.py",
+    )
+
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,args="], check=False, text=True, capture_output=True)
+        lines = (proc.stdout or "").splitlines()
+    except Exception:
+        return
+
+    current_pid = os.getpid()
+    kill_pids = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, args = parts
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == current_pid:
+            continue
+        if any(marker in args for marker in script_markers):
+            kill_pids.append(pid)
+
+    for pid in kill_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _cleanup_stale_audio_processes():
+    """Release stale ALSA playback processes that keep the output card busy."""
+    if os.environ.get("PICARX_AUTO_CLEAN_AUDIO", "1") != "1":
+        return
+
+    stale_markers = (
+        "bluealsa-aplay",
+        "aplay -D default",
+        "aplay -D hw:2,0",
+        "speaker-test -D hw:2,0",
+    )
+
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,args="], check=False, text=True, capture_output=True)
+        lines = (proc.stdout or "").splitlines()
+    except Exception:
+        return
+
+    current_pid = os.getpid()
+    kill_pids = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, args = parts
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == current_pid:
+            continue
+        if any(marker in args for marker in stale_markers):
+            kill_pids.append(pid)
+
+    for pid in kill_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    if not kill_pids and os.geteuid() == 0:
+        pattern = "bluealsa-aplay|aplay -D default|aplay -D hw:2,0|speaker-test -D hw:2,0"
+        try:
+            subprocess.run(["pkill", "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    if not kill_pids and os.geteuid() != 0:
+        try:
+            subprocess.run(["sudo", "-n", "pkill", "-f", "bluealsa-aplay|aplay -D default|aplay -D hw:2,0|speaker-test -D hw:2,0"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+_purge_legacy_python311_paths()
+_add_vilib_dependency_paths()
+_cleanup_orphan_camera_processes()
+_cleanup_stale_audio_processes()
 
 from picarx import Picarx
 from robot_hat import Music, Pin
@@ -22,77 +182,452 @@ import time
 import threading
 import random
 
-import os
-
 os.popen("pinctrl set 20 op dh") # enable robot_hat speake switch
 current_path = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_path) # change working directory
 
-input_mode = None
-with_img = True
-args = sys.argv[1:]
-if '--keyboard' in args:
-    input_mode = 'keyboard'
-else:
-    input_mode = 'voice'
 
-if '--no-img' in args:
-    with_img = False
-else:
+def _device_name_for_alsa_lookup(device_name):
+    value = str(device_name or "").strip()
+    if not value:
+        return ""
+    return value.lower().replace("plughw:", "hw:")
+
+
+def _audio_override_is_valid_output(device_override):
+    """Reject input-only ALSA devices such as a USB mic when they are passed as speaker output."""
+    candidate = str(device_override or "").strip()
+    if not candidate:
+        return True
+
+    candidate_lower = candidate.lower()
+    if candidate_lower in {"default", "sysdefault", "dmix", "plug:dmix", "auto"}:
+        return True
+
+    try:
+        pyaudio_module = sr.Microphone.get_pyaudio()
+        pa = pyaudio_module.PyAudio()
+    except Exception:
+        return True
+
+    try:
+        count = pa.get_device_count()
+        for idx in range(count):
+            try:
+                info = pa.get_device_info_by_index(idx)
+            except Exception:
+                continue
+            name = str(info.get("name") or "").lower()
+            if not name:
+                continue
+            if f"(hw:{candidate_lower})" in name or f"(hw:{_device_name_for_alsa_lookup(candidate_lower)})" in name:
+                if int(info.get("maxOutputChannels") or 0) <= 0:
+                    return False
+                return True
+        
+        if re.search(r"hw:(\d+)", _device_name_for_alsa_lookup(candidate_lower)):
+            return True
+        return True
+    except Exception:
+        return True
+    finally:
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+
+
+def _get_audio_device_candidates(include_input=False):
+    candidates = []
+    try:
+        pyaudio_module = sr.Microphone.get_pyaudio()
+        pa = pyaudio_module.PyAudio()
+    except Exception:
+        return candidates
+
+    try:
+        count = pa.get_device_count()
+        for idx in range(count):
+            try:
+                info = pa.get_device_info_by_index(idx)
+            except Exception:
+                continue
+            name = str(info.get("name") or "")
+            max_in = int(info.get("maxInputChannels") or 0)
+            max_out = int(info.get("maxOutputChannels") or 0)
+            if include_input and max_in > 0:
+                candidates.append((idx, name, "input"))
+            if not include_input and max_out > 0:
+                candidates.append((idx, name, "output"))
+    except Exception:
+        pass
+    finally:
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+    return candidates
+
+
+def _apply_audio_route(profile_name=None, device_override=None):
+    """Set ALSA environment variables for separate input and output routes.
+
+    Playback output should use an actual output-capable device such as the HifiBerry DAC.
+    Input capture should use the USB mic device, which is usually capture-only.
+    """
+    if profile_name is not None:
+        profile_name = profile_name.lower()
+
+    playback_preset = {
+        "hdmi": {
+            "AUDIODEV": "default",
+            "PICARX_AUDIODEV": "default",
+            "PICARX_AUDIO_CARD_ID": "0",
+            "PICARX_AUDIO_CARD_NAME": "vc4hdmi",
+            "PICARX_AUDIO_CARD_HINT": "hdmi",
+        },
+        "usb": {
+            "AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIO_CARD_ID": "2",
+            "PICARX_AUDIO_CARD_NAME": "snd_rpi_hifiberry_dac",
+            "PICARX_AUDIO_CARD_HINT": "hifiberry",
+        },
+        "i2s": {
+            "AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIO_CARD_ID": "2",
+            "PICARX_AUDIO_CARD_NAME": "snd_rpi_hifiberry_dac",
+            "PICARX_AUDIO_CARD_HINT": "hifiberry",
+        },
+        "auto": {
+            "AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIODEV": "plughw:2,0",
+            "PICARX_AUDIO_CARD_ID": "2",
+            "PICARX_AUDIO_CARD_NAME": "snd_rpi_hifiberry_dac",
+            "PICARX_AUDIO_CARD_HINT": "hifiberry",
+        },
+    }.get(profile_name or "auto", {})
+
+    if device_override:
+        device_override = str(device_override).strip()
+        if device_override.startswith("hw:") or device_override.startswith("plughw:"):
+            if "USB" in device_override.upper() or "DEVICE" in device_override.upper() or "3,0" in device_override:
+                print(f"Ignoring capture-only USB device for mixer output: {device_override}")
+                device_override = None
+        if device_override:
+            os.environ["AUDIODEV"] = device_override
+            os.environ["PICARX_AUDIODEV"] = device_override
+            os.environ.setdefault("PICARX_AUDIO_CARD_ID", "2")
+            os.environ.setdefault("PICARX_AUDIO_CARD_NAME", "speaker")
+            os.environ.setdefault("PICARX_AUDIO_CARD_HINT", "output")
+            return
+
+    for key, value in playback_preset.items():
+        os.environ[key] = str(value)
+
+    if profile_name and profile_name not in {"auto"}:
+        print(f"Playback route selected: {profile_name}")
+
+
+def initialize_runtime():
+    global input_mode, with_img, audio_profile, audio_device_override
+    global my_car, music, led, openai_helper
+
+    input_mode = None
     with_img = True
+    args = sys.argv[1:]
 
-# openai assistant init
-# =================================================================
-openai_helper = OpenAiHelper(OPENAI_API_KEY, OPENAI_ASSISTANT_ID, 'picarx')
+    # audio selection is a CLI option instead of editing environment variables by hand
+    audio_profile = "auto"
+    audio_device_override = None
+    for i, arg in enumerate(args):
+        low = arg.lower()
+        if low == "--keyboard":
+            input_mode = 'keyboard'
+        elif low == "--voice":
+            input_mode = 'voice'
+        elif low == "--no-img":
+            with_img = False
+        elif low in {"--audio", "--audio-profile"} and i + 1 < len(args):
+            audio_profile = args[i + 1].lower()
+        elif low == "--audio-device" and i + 1 < len(args):
+            audio_device_override = args[i + 1]
 
-LANGUAGE = []
-# LANGUAGE = ['zh', 'en'] # config stt language code, https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes
+    if input_mode is None:
+        input_mode = 'voice'
 
-# VOLUME_DB = 5
-VOLUME_DB = 3
+    # Startup health check: clear stale ALSA holders before initializing playback.
+    _cleanup_stale_audio_processes()
+    if audio_device_override:
+        _apply_audio_route(device_override=audio_device_override)
+    else:
+        _apply_audio_route(audio_profile)
 
-# select tts voice role, counld be "alloy, echo, fable, onyx, nova, and shimmer"
-# https://platform.openai.com/docs/guides/text-to-speech/supported-languages
-TTS_VOICE = 'echo'
+    # The capture side must remain separate from the speaker path.
+    capture_index = _select_input_device_index()
+    if capture_index is not None:
+        print(f"Startup audio route: output uses HifiBerry DAC, input uses PyAudio device index {capture_index}.")
+    else:
+        print("Startup audio route: output uses HifiBerry DAC; no USB capture device was detected yet.")
 
-# voice instructions for vibe
-# https://www.openai.fm/
-VOICE_INSTRUCTIONS = ""
+    # For backwards compatibility with the original example setup, keep these as defaults.
+    os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
 
-SOUND_EFFECT_ACTIONS = ["honking", "start engine"]
+    # openai assistant init
+    # =================================================================
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is empty; set it in gpt_examples/keys.py or in the environment")
 
-# car init 
-# =================================================================
-try:
-    my_car = Picarx()
-    time.sleep(1)
-except Exception as e:
-    raise RuntimeError(e)
+    openai_helper = OpenAiHelper(
+        OPENAI_API_KEY,
+        OPENAI_ASSISTANT_ID or "",
+        OPENAI_ASSISTANT_NAME,
+        model=OPENAI_ASSISTANT_MODEL,
+    )
 
-music = Music()
+    # car init
+    # =================================================================
+    try:
+        my_car = Picarx()
+        time.sleep(1)
+    except Exception as e:
+        raise RuntimeError(e)
 
-led = Pin('LED')
+    try:
+        music = Music()
+    except Exception as exc:
+        msg = str(exc)
+        if "Device or resource busy" in msg or "Couldn't open audio device" in msg or "No such device" in msg:
+            print("Detected a stale ALSA output lock. Attempting to clear the stale audio holder and retrying once...")
+            _cleanup_stale_audio_processes()
+            try:
+                music = Music()
+            except Exception as retry_exc:
+                print(f"Audio mixer unavailable after cleanup: {retry_exc}. If this persists, run: sudo pkill -f 'bluealsa-aplay|aplay -D default|aplay -D hw:2,0|speaker-test -D hw:2,0'")
+                music = None
+        else:
+            print(f"Audio mixer unavailable: {exc}. Continuing without TTS/sound effects; voice capture remains available if a mic is detected.")
+            music = None
 
-DEFAULT_HEAD_PAN = 0
-DEFAULT_HEAD_TILT = 20
+        if music is None:
+            class _NullMusic:
+                def __init__(self, *args, **kwargs):
+                    pass
 
-# Vilib start
-# =================================================================
-if with_img:
-    from vilib import Vilib
-    import cv2
+                def sound_play(self, *args, **kwargs):
+                    return None
 
-    Vilib.camera_start(vflip=False,hflip=False)
-    Vilib.show_fps()
-    Vilib.display(local=False,web=True)
+                def sound_play_threading(self, *args, **kwargs):
+                    return None
 
-    while True:
-        if Vilib.flask_start:
-            break
-        time.sleep(0.01)
+                def music_play(self, *args, **kwargs):
+                    return None
 
-    time.sleep(.5)
-    print('\n')
+                def music_stop(self, *args, **kwargs):
+                    return None
+
+                def music_set_volume(self, *args, **kwargs):
+                    return None
+
+                def music_get_volume(self, *args, **kwargs):
+                    return 0
+
+                def music_pause(self, *args, **kwargs):
+                    return None
+
+                def music_resume(self, *args, **kwargs):
+                    return None
+
+            music = _NullMusic()
+
+    led = Pin('LED')
+
+    # Vilib start
+    # =================================================================
+    if with_img:
+        try:
+            from vilib import Vilib
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to import vilib. This usually means the camera stack is not on the active Python path. "
+                "Start the script with the repo's configured interpreter or run the no-image mode (--no-img). "
+                f"Original error: {exc}"
+            ) from exc
+
+        import cv2
+
+        Vilib.camera_start(vflip=False,hflip=False)
+        Vilib.show_fps()
+        Vilib.display(local=False,web=True)
+
+        while True:
+            if Vilib.flask_start:
+                break
+            time.sleep(0.01)
+
+        time.sleep(.5)
+        print('\n')
+
+    return input_mode
+
+
+def _voice_input_available():
+    return _select_input_device_index() is not None
+
+
+def _select_input_device_index():
+    try:
+        pyaudio_module = sr.Microphone.get_pyaudio()
+        pa = pyaudio_module.PyAudio()
+    except Exception:
+        return None
+
+    try:
+        count = pa.get_device_count()
+        if count <= 0:
+            return None
+
+        # The USB mic is the capture device on this stack and is usually reported as index 1.
+        # Prefer the actual device map instead of the stale default ALSA route and avoid forcing
+        # the broken HDMI/default capture indices during startup.
+        for preferred in (1, 3, 2, 0):
+            if preferred >= count:
+                continue
+            try:
+                device_info = pa.get_device_info_by_index(preferred)
+            except Exception:
+                continue
+            if int(device_info.get("maxInputChannels") or 0) > 0:
+                return preferred
+
+        preferred_names = ["usb", "mic", "capture", "input", "audio"]
+        explicit_candidates = []
+        best_index = None
+        best_score = -1
+
+        for idx in range(count):
+            try:
+                device_info = pa.get_device_info_by_index(idx)
+            except Exception:
+                continue
+            input_channels = int(device_info.get("maxInputChannels") or 0)
+            if input_channels <= 0:
+                continue
+            name = str(device_info.get("name") or "").lower()
+
+            if "usb" in name or "device" in name or "audio" in name:
+                explicit_candidates.append(idx)
+
+            score = 0
+            if "usb" in name:
+                score += 60
+            if "mic" in name or "capture" in name:
+                score += 35
+            if "input" in name:
+                score += 10
+            if any(token in name for token in preferred_names):
+                score += 5
+            if "hifiberry" in name or "wm8960" in name or "robot" in name or "robot_hat" in name:
+                score += 15
+            if score > best_score:
+                best_index = idx
+                best_score = score
+
+        # Prefer the actual USB microphone when present. This avoids the broken ALSA default route.
+        for idx in explicit_candidates:
+            try:
+                device_info = pa.get_device_info_by_index(idx)
+                name = str(device_info.get("name") or "").lower()
+            except Exception:
+                continue
+            if "usb" in name or "device" in name:
+                return idx
+
+        if best_index is not None:
+            return best_index
+
+        for idx in range(count):
+            try:
+                if int(pa.get_device_info_by_index(idx).get("maxInputChannels") or 0) > 0:
+                    return idx
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+
+
+def _ensure_voice_or_keyboard_mode():
+    global input_mode
+    if input_mode == 'voice':
+        selected = _select_input_device_index()
+        if selected is None:
+            print("Voice mode selected; no usable USB capture device was detected, so the script will fall back to keyboard input if the mic fails to open.")
+            return 'voice'
+        print(f"Voice mode selected; using capture device index {selected}.")
+    return input_mode
+
+
+def _open_microphone_for_listen(device_index=None):
+    """Open the mic explicitly instead of using the flaky context-manager teardown.
+
+    speech_recognition.Microphone.__enter__ suppresses its own audio-open errors and returns an
+    object whose stream is still None. When the context manager later exits, it calls
+    self.stream.close() on that None and raises: AttributeError: 'NoneType' object has no
+    attribute 'close'.
+    """
+    device_index = 1 if device_index is None else device_index
+    mic = sr.Microphone(device_index=device_index, chunk_size=8192)
+    mic.audio = None
+    mic.stream = None
+
+    try:
+        mic.audio = mic.pyaudio_module.PyAudio()
+        mic.stream = sr.Microphone.MicrophoneStream(
+            mic.audio.open(
+                input_device_index=mic.device_index,
+                channels=1,
+                format=mic.format,
+                rate=mic.SAMPLE_RATE,
+                frames_per_buffer=mic.CHUNK,
+                input=True,
+            )
+        )
+        return mic
+    except Exception:
+        if mic.audio is not None:
+            try:
+                mic.audio.terminate()
+            except Exception:
+                pass
+        mic.audio = None
+        mic.stream = None
+        raise
+
+
+def _close_microphone_for_listen(mic):
+    try:
+        if getattr(mic, "stream", None) is not None:
+            mic.stream.close()
+    except Exception:
+        pass
+    finally:
+        mic.stream = None
+        try:
+            if getattr(mic, "audio", None) is not None:
+                mic.audio.terminate()
+        except Exception:
+            pass
+        mic.audio = None
+
+# For backwards compatibility with the original example setup, keep these as defaults.
+os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
 
 # speech_recognition init
 # =================================================================
@@ -224,6 +759,158 @@ def action_handler():
 action_thread = threading.Thread(target=action_handler)
 action_thread.daemon = True
 
+# Head and motor limits and initial values
+DEFAULT_MOTOR_SPEED = 0
+DEFAULT_DIR_SERVO_ANGLE = 0
+DEFAULT_HEAD_PAN = 0 # initial head pan angle
+DEFAULT_HEAD_TILT = 0 # initial head tilt angle
+MAX_MOTOR_SPEED = 100
+MIN_MOTOR_SPEED = 0
+MAX_DIR_SERVO_ANGLE = 45
+MIN_DIR_SERVO_ANGLE = -45
+MAX_HEAD_PAN = 55
+MIN_HEAD_PAN = -55
+MAX_HEAD_TILT = 55
+MIN_HEAD_TILT = -55
+
+motor_speed = DEFAULT_MOTOR_SPEED   # initial motor speed
+dir_servo_angle = DEFAULT_DIR_SERVO_ANGLE # initial direction
+
+head_pan = DEFAULT_HEAD_PAN   # initial head pan angle
+head_tilt = DEFAULT_HEAD_TILT # initial head tilt angle
+
+def reset_motor_and_direction(motor_speed=motor_speed, dir_servo_angle=dir_servo_angle):
+    my_car.forward(MIN_MOTOR_SPEED)
+    my_car.stop()
+    my_car.set_dir_servo_angle(dir_servo_angle)
+    return motor_speed, dir_servo_angle
+
+def motor_forward(motor_speed): 
+    # motor_speed = abs(motor_speed)
+    motor_speed += 5
+    if motor_speed > MAX_MOTOR_SPEED:
+        motor_speed = MAX_MOTOR_SPEED
+    elif motor_speed < MIN_MOTOR_SPEED:
+        motor_speed = MIN_MOTOR_SPEED
+    my_car.forward(motor_speed)
+    return motor_speed
+
+def motor_backward(motor_speed):
+    # motor_speed = abs(motor_speed)
+    motor_speed += 5
+    if motor_speed > MAX_MOTOR_SPEED:
+        motor_speed = MAX_MOTOR_SPEED
+    elif motor_speed < MIN_MOTOR_SPEED:
+        motor_speed = MIN_MOTOR_SPEED
+    # motor speed adjustment, a positive increment that will have sign reversal in backward movement
+    my_car.backward(motor_speed)
+    return motor_speed
+
+def steer_right(dir_servo_angle):
+    dir_servo_angle += 5
+    if dir_servo_angle > MAX_DIR_SERVO_ANGLE:
+        dir_servo_angle = MAX_DIR_SERVO_ANGLE
+    my_car.set_dir_servo_angle(dir_servo_angle)
+    return dir_servo_angle
+
+def steer_left(dir_servo_angle):
+    dir_servo_angle -= 5
+    if dir_servo_angle < MIN_DIR_SERVO_ANGLE:
+        dir_servo_angle = MIN_DIR_SERVO_ANGLE
+    my_car.set_dir_servo_angle(dir_servo_angle)
+    return dir_servo_angle
+
+def stop_car():
+    my_car.forward(MIN_MOTOR_SPEED)
+    my_car.stop()
+    return MIN_MOTOR_SPEED
+
+def reset_head_position(head_pan=head_pan, head_tilt=head_tilt ):
+    my_car.set_cam_tilt_angle(head_tilt)
+    my_car.set_cam_pan_angle(head_pan)
+    return head_pan, head_tilt
+
+def tilt_head_down(head_tilt):
+    head_tilt -= 5
+    if head_tilt < MIN_HEAD_TILT:
+        head_tilt = MIN_HEAD_TILT
+    my_car.set_cam_tilt_angle(head_tilt)
+    return head_tilt
+
+def tilt_head_up(head_tilt):
+    head_tilt += 5
+    if head_tilt > MAX_HEAD_TILT:
+        head_tilt = MAX_HEAD_TILT
+    my_car.set_cam_tilt_angle(head_tilt)
+    return head_tilt
+
+def pan_head_left(head_pan):
+    head_pan -= 5
+    if head_pan < MIN_HEAD_PAN:
+        head_pan = MIN_HEAD_PAN
+    my_car.set_cam_pan_angle(head_pan)
+    return head_pan
+
+def pan_head_right(head_pan):
+    head_pan += 5
+    if head_pan > MAX_HEAD_PAN:
+        head_pan = MAX_HEAD_PAN
+    my_car.set_cam_pan_angle(head_pan)
+    return head_pan
+
+def shutdown_gptcar():
+    my_car.forward(MIN_MOTOR_SPEED)
+    my_car.stop()
+    my_car.set_dir_servo_angle(DEFAULT_DIR_SERVO_ANGLE)
+    reset_head_position(DEFAULT_HEAD_PAN, DEFAULT_HEAD_TILT)
+    return MIN_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE, DEFAULT_HEAD_PAN, DEFAULT_HEAD_TILT
+
+def manual_keyboard_loop():
+    global motor_speed, dir_servo_angle, head_pan, head_tilt
+    head_pan = DEFAULT_HEAD_PAN
+    head_tilt = DEFAULT_HEAD_TILT
+    print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, i/m =tilt up|down, k =cntr, j/l =pan lt|rt, ctrl+c =exit")
+
+    while True:
+        key = readchar.readkey().lower()
+        if key in ('wxsad'):
+            if key == 'w': # Move forward with increasing motor speed and steering current direction
+                # dir_servo_angle = 0
+                motor_speed = motor_forward(motor_speed)
+
+            elif key == 'x': # move backward with increasing motor speed and steering current dir
+                # dir_servo_angle = 0 
+                motor_speed = motor_backward(motor_speed)
+
+            elif key == 'a': # Turn left with current motor speed and direction
+                dir_servo_angle = steer_left(dir_servo_angle)
+
+            elif key == 'd': # Turn right with current motor speed and direction
+                dir_servo_angle = steer_right(dir_servo_angle)
+
+            elif key == 's': # STOP! Reset the picar's direction and motor speed, then STOP!!!
+                motor_speed = stop_car()
+
+        elif key in ('ikmjl'):
+            if key == 'i': # Move tilt angle up
+                head_tilt = tilt_head_up(head_tilt)
+
+            elif key == 'k': # Reset tilt and pan angle to 0 (level+straight)
+                head_pan, head_tilt = reset_head_position(head_pan = DEFAULT_HEAD_PAN, head_tilt = DEFAULT_HEAD_TILT)
+
+            elif key == 'm': # Move tilt angle down
+                head_tilt = tilt_head_down(head_tilt)
+
+            elif key == 'j': # Move pan angle left
+                head_pan = pan_head_left(head_pan)
+    
+            elif key == 'l': # Move pan angle right
+                head_pan = pan_head_right(head_pan)
+
+        elif key == readchar.key.CTRL_C:
+            motor_speed, dir_servo_angle, head_pan, head_tilt = shutdown_gptcar()
+            return
+
 
 # main
 # =================================================================
@@ -232,6 +919,10 @@ def main():
     global speech_loaded
     global action_status, actions_to_be_done
     global tts_file
+    global input_mode
+
+    initialize_runtime()
+    input_mode = _ensure_voice_or_keyboard_mode()
 
     my_car.reset()
     my_car.set_cam_tilt_angle(DEFAULT_HEAD_TILT)
@@ -251,12 +942,42 @@ def main():
             with action_lock:
                 action_status = 'standby'
 
-            _stderr_back = redirect_error_2_null() # ignore error print to ignore ALSA errors
-            # If the chunk_size is set too small (default_size=1024), it may cause the program to freeze
-            with sr.Microphone(chunk_size=8192) as source:
-                cancel_redirect_error(_stderr_back) # restore error print
-                recognizer.adjust_for_ambient_noise(source)
-                audio = recognizer.listen(source)
+            voice_candidates = []
+            selected_index = _select_input_device_index()
+            if selected_index is not None:
+                voice_candidates.append(selected_index)
+            for preferred in (1, 3, 2, 0):
+                if preferred not in voice_candidates:
+                    voice_candidates.append(preferred)
+
+            audio = None
+            last_voice_error = None
+            for attempt_index, mic_device_index in enumerate(voice_candidates):
+                mic = None
+                _stderr_back = None
+                try:
+                    _stderr_back = redirect_error_2_null() # ignore ALSA chatter while probing capture devices
+                    mic = _open_microphone_for_listen(mic_device_index)
+                    cancel_redirect_error(_stderr_back)
+                    recognizer.adjust_for_ambient_noise(mic)
+                    audio = recognizer.listen(mic)
+                    break
+                except (AttributeError, OSError, ValueError) as exc:
+                    if _stderr_back is not None:
+                        cancel_redirect_error(_stderr_back)
+                    last_voice_error = exc
+                    if attempt_index == len(voice_candidates) - 1:
+                        break
+                    print(f"Voice input unavailable on capture index {mic_device_index}; trying the next candidate.")
+                finally:
+                    if mic is not None:
+                        _close_microphone_for_listen(mic)
+                        mic = None
+
+            if audio is None:
+                print(f"Voice input unavailable for all capture candidates; falling back to keyboard input. Last error: {last_voice_error}")
+                input_mode = 'keyboard'
+                continue
 
             # stt
             # ----------------------------------------------------------------
@@ -275,10 +996,18 @@ def main():
             with action_lock:
                 action_status = 'standby'
 
-            _result = input(f'\033[1;30m{"intput: "}\033[0m').encode(sys.stdin.encoding).decode('utf-8')
+            _result = input(f'\033[1;30m{"input: "}\033[0m').encode(sys.stdin.encoding).decode('utf-8').strip()
 
             if _result == False or _result == "":
                 print() # new line
+                continue
+
+            if _result.lower() == 'manual':
+                manual_keyboard_loop()
+                continue
+
+            if _result.lower() == 'chat':
+                print("Chat mode selected. Type your message to send to OpenAI.")
                 continue
 
         else:
@@ -394,7 +1123,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\033[31mERROR: {e}\033[m")
     finally:
-        if with_img:
+        if with_img and 'Vilib' in globals():
             Vilib.camera_close()
-        my_car.reset()
+        if 'my_car' in globals():
+            my_car.reset()
+        time.sleep(3)
+
 

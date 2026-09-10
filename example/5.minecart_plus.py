@@ -85,6 +85,9 @@ if __name__=='__main__':
             else:
                 outHandle()
     except KeyboardInterrupt:
+        print("KeyboardInterrupt received, stopping...")
+        px.stop()
+        sleep(0.1)
         pass
     finally:
         px.stop()
