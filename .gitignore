@@ -2,8 +2,11 @@
 build/*
 bk/
 
-# Python cache/bytecode
+# Local virtualenvs and caches
+.venv/
+.venv313/
 __pycache__/
+.pytest_cache/
 *.py[cod]
 
 # Packaging/build outputs
