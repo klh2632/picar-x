@@ -53,9 +53,8 @@ def run_command(cmd):
     return status, result
 
 def sox_volume(input_file, output_file, volume):
-    import sox
-
     try:
+        import sox
         transform = sox.Transformer()
         transform.vol(volume)
 

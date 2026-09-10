@@ -78,6 +78,7 @@ def keep_think(car):
         car.set_cam_tilt_angle(-i*2)
         car.set_dir_servo_angle(i*2)
         sleep(.05)
+    car.reset()  # undo the ramp so the dir servo doesn't stay turned after thinking
 
 def shake_head(car):
     car.stop()

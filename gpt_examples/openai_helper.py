@@ -51,11 +51,12 @@ class OpenAiHelper():
     TTS_OUTPUT_FILE = 'tts_output.mp3'
     TIMEOUT = 30 # seconds
 
-    def __init__(self, api_key, assistant_id, assistant_name, timeout=TIMEOUT, model="gpt-4o") -> None:
+    def __init__(self, api_key, assistant_id, assistant_name, timeout=TIMEOUT, model="gpt-4o", instructions="") -> None:
         self.api_key = api_key
         self.assistant_id = assistant_id
         self.assistant_name = assistant_name
         self.model = model
+        self.instructions = instructions
 
         self.client = OpenAI(api_key=api_key, timeout=timeout)
 
@@ -100,10 +101,10 @@ class OpenAiHelper():
                 "content": [{"type": "input_text", "text": message}],
             }
 
-        return self.client.responses.create(
-            model=self.model,
-            input=[payload],
-        )
+        kwargs = {"model": self.model, "input": [payload]}
+        if self.instructions:
+            kwargs["instructions"] = self.instructions
+        return self.client.responses.create(**kwargs)
 
     def stt(self, audio, language='en'):
         try:

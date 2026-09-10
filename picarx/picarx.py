@@ -12,12 +12,15 @@ if SITE_PACKAGES_311.is_dir():
     sys.path.insert(0, str(SITE_PACKAGES_311))
 
 if "pyaudio" not in sys.modules:
-    _pyaudio_stub = types.ModuleType("pyaudio")
-    _pyaudio_stub.paInt16 = 8
-    _pyaudio_stub.PyAudio = object
-    _pyaudio_portaudio_stub = types.ModuleType("pyaudio._portaudio")
-    sys.modules["pyaudio"] = _pyaudio_stub
-    sys.modules["pyaudio._portaudio"] = _pyaudio_portaudio_stub
+    try:
+        import pyaudio  # noqa: F401  prefer the real implementation when it's installed
+    except ImportError:
+        _pyaudio_stub = types.ModuleType("pyaudio")
+        _pyaudio_stub.paInt16 = 8
+        _pyaudio_stub.PyAudio = object
+        _pyaudio_portaudio_stub = types.ModuleType("pyaudio._portaudio")
+        sys.modules["pyaudio"] = _pyaudio_stub
+        sys.modules["pyaudio._portaudio"] = _pyaudio_portaudio_stub
 
 # Keep the old Picar-X import schema working against current robot_hat releases.
 for legacy_name, target_name in {
