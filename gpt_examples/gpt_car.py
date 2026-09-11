@@ -1,5 +1,7 @@
 import os
 
+from gpt_examples import follow_human_face
+
 from openai_helper import OpenAiHelper
 from keys import (
     OPENAI_API_KEY,
@@ -10,11 +12,17 @@ from keys import (
 from preset_actions import *
 from utils import *
 
+try:
+    SOUND_EFFECT_ACTIONS
+except NameError:
+    SOUND_EFFECT_ACTIONS = ()
+
 # STT/TTS config (see gpt_examples/README.md "Modify parameters")
 LANGUAGE = ['en','zh']  # e.g. ['zh', 'en']; empty list lets Whisper auto-detect all languages
 VOLUME_DB = 3  # TTS post-gain in dB via sox; avoid exceeding 5 to prevent distortion
 TTS_VOICE = 'nova'  # alloy, echo, fable, onyx, nova, or shimmer
 VOICE_INSTRUCTIONS = ""  # https://www.openai.fm/
+STT_NO_SPEECH_FILLER = "this is the conversation between me and a robot"
 
 import readline # optimize keyboard input, only need to import
 
@@ -811,8 +819,13 @@ recognizer.dynamic_energy_ratio = 1.6
 
 # speak_hanlder
 # =================================================================
+global speech_loaded
 speech_loaded = False
+
+global speech_lock
 speech_lock = threading.Lock()
+
+global tts_file
 tts_file = None
 
 def speak_hanlder():
@@ -828,6 +841,7 @@ def speak_hanlder():
                 speech_loaded = False
         time.sleep(0.05)
 
+global speak_thread
 speak_thread = threading.Thread(target=speak_hanlder)
 speak_thread.daemon = True
 
@@ -858,6 +872,9 @@ MAX_HEAD_PAN = 55
 MIN_HEAD_PAN = -55
 MAX_HEAD_TILT = 55
 MIN_HEAD_TILT = -55
+FOLLOW_HUMAN_FACE_DURATION = 60.0 # seconds
+follow_duration=FOLLOW_HUMAN_FACE_DURATION
+
 
 motor_speed = DEFAULT_MOTOR_SPEED   # initial motor speed
 dir_servo_angle = DEFAULT_DIR_SERVO_ANGLE # initial direction
@@ -867,6 +884,8 @@ head_tilt = DEFAULT_HEAD_TILT # initial head tilt angle
 
 WARNING_VOLTAGE = 6.8  # Alert the user
 SHUTDOWN_VOLTAGE = 6.4 # Force safe shutdown to protect the Pi and batteries
+SPEECH_WAIT_TIMEOUT_SEC = 20.0
+ACTION_WAIT_TIMEOUT_SEC = 8.0
 
 
 def action_handler():
@@ -895,24 +914,33 @@ def action_handler():
 
         if led_status == 'standby':
             if time.time() - last_led_time > LED_DOUBLE_BLINK_INTERVAL:
-                led.off()
-                led.on()
-                sleep(.1)
-                led.off()
-                sleep(.1)
-                led.on()
-                sleep(.1)
-                led.off()
+                try:
+                    led.off()
+                    led.on()
+                    sleep(.1)
+                    led.off()
+                    sleep(.1)
+                    led.on()
+                    sleep(.1)
+                    led.off()
+                except Exception as exc:
+                    print(f"LED update error (standby): {exc}")
                 last_led_time = time.time()
         elif led_status == 'think':
             if time.time() - last_led_time > LED_BLINK_INTERVAL:
-                led.off()
-                sleep(LED_BLINK_INTERVAL)
-                led.on()
-                sleep(LED_BLINK_INTERVAL)
+                try:
+                    led.off()
+                    sleep(LED_BLINK_INTERVAL)
+                    led.on()
+                    sleep(LED_BLINK_INTERVAL)
+                except Exception as exc:
+                    print(f"LED update error (think): {exc}")
                 last_led_time = time.time()
         elif led_status == 'actions':
-                led.on() 
+                try:
+                    led.on()
+                except Exception as exc:
+                    print(f"LED update error (actions): {exc}")
 
         # actions
         # ------------------------------
@@ -1052,7 +1080,7 @@ def activate_camera():
     # Implement the logic to activate the camera here
     pass
 
-def _speak_text(text):
+def _speak_text(text) -> None:
     """Speak text through the existing TTS pipeline (same path used for GPT replies) and
     block until playback finishes, instead of a separate ad-hoc TTS call."""
     global tts_file, speech_loaded
@@ -1076,6 +1104,13 @@ def _speak_text(text):
             if not speech_loaded:
                 break
         time.sleep(.01)
+
+def _follow_human_face(follow_duration: float = 60.0):
+    if 'Vilib' not in globals() or Vilib is None:
+        print("Follow-face unavailable: camera runtime is not initialized.")
+        return None
+
+    return follow_human_face.follow_human_face(my_car, Vilib, _speak_text, follow_duration)
 
 
 def main_battery_check(prn_voltage: bool = False):
@@ -1127,7 +1162,7 @@ def activate_keyboard_input():
 
 # Shared by keyboard 'manual' mode and voice commands so both dispatch identically.
 def _apply_manual_key(key):
-    global motor_speed, dir_servo_angle, head_pan, head_tilt
+    global motor_speed, dir_servo_angle, head_pan, head_tilt, follow_duration
     if key in ('wxsad'):
         if key == 'w': # Move forward with increasing motor speed and steering current direction
             motor_speed = motor_forward(motor_speed)
@@ -1159,7 +1194,7 @@ def _apply_manual_key(key):
 
         elif key == 'l': # Move pan angle right
             head_pan = pan_head_right(head_pan)
-    elif key in 'rvcbt':
+    elif key in 'rvcbtf':
         if key == 'r': # Reset Motor and Direction
             motor_speed, dir_servo_angle = reset_motor_and_direction(DEFAULT_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE)
         elif key == 'v': # Activate voice input
@@ -1170,6 +1205,8 @@ def _apply_manual_key(key):
             main_battery_check(True)
         elif key == 't': # Manual input
             activate_keyboard_input()
+        elif key == 'f': # Follow human face for a duration
+            _follow_human_face(follow_duration)
 
 
 
@@ -1189,14 +1226,29 @@ _VOICE_COMMAND_KEYS = {
     'v': ('voice input', 'activate voice input'),
     'c': ('camera', 'activate camera', 'start camera'),
     'b': ('battery check', 'check battery', 'battery status'),
-    't': ('manual input', 'type commands', 'keyboard', 'type')
+    't': ('manual input', 'type commands', 'keyboard', 'type'),
+    'f': ('follow face', 'follow the face', 'follow that face', 'follow human face', 'track face', 'track human face')
 }
 
 def _match_voice_command_key(text):
-    normalized = str(text or '').strip().lower().rstrip('.!?')
+    normalized = re.sub(r"\s+", " ", str(text or '').strip().lower().rstrip('.!?'))
+
+    # Prefer local face-follow control for natural phrasings such as
+    # "follow that face" or "can you track the face".
+    if "face" in normalized and ("follow" in normalized or "track" in normalized):
+        return 'f'
+
     for key, phrases in _VOICE_COMMAND_KEYS.items():
         if normalized in phrases:
             return key
+
+    # Graceful fallback: allow phrase containment for longer commands
+    # like "please go forward" without requiring exact equality.
+    for key, phrases in _VOICE_COMMAND_KEYS.items():
+        for phrase in phrases:
+            if phrase and phrase in normalized:
+                return key
+
     return None
 
 def manual_keyboard_loop():
@@ -1216,7 +1268,7 @@ def manual_keyboard_loop():
             motor_speed, dir_servo_angle, head_pan, head_tilt = shutdown_gptcar()
             return
 
-        if key in ('wxsadikmjlrvcbt'):
+        if key in ('wxsadikmjlrvcbtf'):
             _apply_manual_key(key)
 
         elif key == readchar.key.CTRL_C:
@@ -1224,8 +1276,6 @@ def manual_keyboard_loop():
             return
 
 
-
-        
 # main
 # =================================================================
 def main():
@@ -1236,6 +1286,7 @@ def main():
     global input_mode
     global motor_speed, dir_servo_angle, head_pan, head_tilt
     global last_time
+    global follow_duration
 
     initialize_runtime()
     input_mode = _ensure_voice_or_keyboard_mode()
@@ -1321,6 +1372,13 @@ def main():
             _result = openai_helper.stt(audio, language=LANGUAGE)
             gray_print(f"stt takes: {time.time() - st:.3f} s")
 
+            if isinstance(_result, str):
+                _result = _result.strip()
+                if _result.lower() == STT_NO_SPEECH_FILLER:
+                    print("Ignoring filler STT text from silence/noise; listening again.")
+                    print()
+                    continue
+
             if _result == False or _result == "":
                 print() # new line
                 continue
@@ -1378,6 +1436,8 @@ def main():
         # actions & TTS
         # ----------------------------------------------------------------
         _sound_actions = [] 
+        actions = []
+        answer = ''
         try:
             if isinstance(response, dict):
                 if 'actions' in response:
@@ -1428,7 +1488,7 @@ def main():
             with action_lock:
                 actions_to_be_done = actions
                 gray_print(f'actions: {actions_to_be_done}')
-                action_status = 'actions'
+                action_status = 'actions' if actions_to_be_done else 'actions_done'
 
             # --- sound effects and voice ---
             for _sound in _sound_actions:
@@ -1443,18 +1503,32 @@ def main():
 
             # ---- wait speak done ----
             if _tts_status:
+                speech_wait_started = time.time()
                 while True:
                     with speech_lock:
                         if not speech_loaded:
                             break
+                    if time.time() - speech_wait_started > SPEECH_WAIT_TIMEOUT_SEC:
+                        print("TTS wait timeout; clearing speech flag and continuing.")
+                        with speech_lock:
+                            speech_loaded = False
+                        break
                     time.sleep(.01)
 
             # ---- wait actions done ----
-            while True:
-                with action_lock:
-                    if action_status != 'actions':
+            if actions:
+                action_wait_started = time.time()
+                while True:
+                    with action_lock:
+                        if action_status != 'actions':
+                            break
+                    if time.time() - action_wait_started > ACTION_WAIT_TIMEOUT_SEC:
+                        print("Action wait timeout; forcing action state to actions_done and continuing.")
+                        with action_lock:
+                            action_status = 'actions_done'
+                            actions_to_be_done = []
                         break
-                time.sleep(.01)
+                    time.sleep(.01)
 
             ##
             print() # new line
