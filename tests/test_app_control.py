@@ -133,9 +133,20 @@ def _install_gpt_car_stubs(fake_sr=None):
         def off(self, *args, **kwargs):
             return None
 
+    class FakeSunfounderBattery:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_battery_voltage(self):
+            return 8.4
+
     robot_hat_module.Music = FakeMusic
     robot_hat_module.Pin = FakePin
     sys.modules["robot_hat"] = robot_hat_module
+
+    battery_module = types.ModuleType("robot_hat.services.battery.sunfounder_battery")
+    battery_module.Battery = FakeSunfounderBattery
+    sys.modules["robot_hat.services.battery.sunfounder_battery"] = battery_module
 
 
 def _run_gpt_car(argv):

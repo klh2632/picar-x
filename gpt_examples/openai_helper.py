@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import shutil
 import time
@@ -161,16 +162,32 @@ class OpenAiHelper():
             print(f"Could not request results from Whisper API; {e}")
             return False
 
+    @staticmethod
+    def _parse_json_response(value):
+        """Parse the model's {"actions": [...], "answer": "..."} reply safely.
+
+        Never eval() model output: it's untrusted text and eval() would execute arbitrary
+        code embedded in it. Strip markdown code fences the model sometimes adds despite
+        being told not to.
+        """
+        text = str(value or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            return str(value)
+
     def dialogue(self, msg):
         chat_print("user", msg)
         try:
             response = self._response(msg)
             value = self._extract_text(response)
             chat_print(self.assistant_name, value)
-            try:
-                return eval(value)
-            except Exception:
-                return str(value)
+            return self._parse_json_response(value)
         except Exception as exc:
             print(f"dialogue err: {exc}")
             return False
@@ -181,10 +198,7 @@ class OpenAiHelper():
             response = self._response(msg, image_path=img_path)
             value = self._extract_text(response)
             chat_print(self.assistant_name, value)
-            try:
-                return eval(value)
-            except Exception:
-                return str(value)
+            return self._parse_json_response(value)
         except Exception as exc:
             print(f"dialogue_with_img err: {exc}")
             return False

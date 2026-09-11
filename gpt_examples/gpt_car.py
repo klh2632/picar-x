@@ -13,7 +13,7 @@ from utils import *
 # STT/TTS config (see gpt_examples/README.md "Modify parameters")
 LANGUAGE = ['en','zh']  # e.g. ['zh', 'en']; empty list lets Whisper auto-detect all languages
 VOLUME_DB = 3  # TTS post-gain in dB via sox; avoid exceeding 5 to prevent distortion
-TTS_VOICE = 'echo'  # alloy, echo, fable, onyx, nova, or shimmer
+TTS_VOICE = 'nova'  # alloy, echo, fable, onyx, nova, or shimmer
 VOICE_INSTRUCTIONS = ""  # https://www.openai.fm/
 
 import readline # optimize keyboard input, only need to import
@@ -185,6 +185,12 @@ _cleanup_stale_audio_processes()
 
 from picarx import Picarx
 from robot_hat import Music, Pin
+try:
+    # The vendored robot_hat shim only re-exports a curated name list at the top level and
+    # doesn't include this, so import it directly from its real submodule path.
+    from robot_hat.services.battery.sunfounder_battery import Battery as SunfounderBattery
+except Exception:
+    SunfounderBattery = None
 
 import time
 import threading
@@ -199,6 +205,7 @@ audio_device_override = None
 my_car = None
 music = None
 led = None
+battery = None
 openai_helper = None
 
 os.popen("pinctrl set 20 op dh") # enable robot_hat speake switch
@@ -519,6 +526,19 @@ def initialize_runtime():
             music = _NullMusic()
 
     led = Pin('LED')
+
+    # battery init
+    # =================================================================
+    global battery
+    if SunfounderBattery is None:
+        print("Battery ADC support not available in this robot_hat install; battery checks will be skipped.")
+        battery = None
+    else:
+        try:
+            battery = SunfounderBattery(channel="A4")  # RoboHAT v4's documented battery ADC channel
+        except Exception as exc:
+            print(f"Battery ADC unavailable: {exc}. Battery checks will be skipped.")
+            battery = None
 
     # Vilib start
     # =================================================================
@@ -845,6 +865,10 @@ dir_servo_angle = DEFAULT_DIR_SERVO_ANGLE # initial direction
 head_pan = DEFAULT_HEAD_PAN   # initial head pan angle
 head_tilt = DEFAULT_HEAD_TILT # initial head tilt angle
 
+WARNING_VOLTAGE = 6.8  # Alert the user
+SHUTDOWN_VOLTAGE = 6.4 # Force safe shutdown to protect the Pi and batteries
+
+
 def action_handler():
     global action_status, actions_to_be_done, led_status, last_action_status, last_led_status
     global dir_servo_angle
@@ -1020,6 +1044,87 @@ def shutdown_gptcar():
     reset_head_position(DEFAULT_HEAD_PAN, DEFAULT_HEAD_TILT)
     return MIN_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE, DEFAULT_HEAD_PAN, DEFAULT_HEAD_TILT
 
+def activate_voice_input():
+    global input_mode
+    input_mode = 'voice'
+
+def activate_camera():
+    # Implement the logic to activate the camera here
+    pass
+
+def _speak_text(text):
+    """Speak text through the existing TTS pipeline (same path used for GPT replies) and
+    block until playback finishes, instead of a separate ad-hoc TTS call."""
+    global tts_file, speech_loaded
+    if openai_helper is None:
+        print(f"TTS unavailable (no OpenAI helper): {text}")
+        return
+    _time = time.strftime("%y-%m-%d_%H-%M-%S", time.localtime())
+    _tts_f = f"./tts/{_time}_raw.wav"
+    if not openai_helper.text_to_speech(text, _tts_f, TTS_VOICE, response_format='wav', instructions=VOICE_INSTRUCTIONS):
+        print(f"TTS failed for: {text}")
+        return
+    _tts_file = f"./tts/{_time}_{VOLUME_DB}dB.wav"
+    if not sox_volume(_tts_f, _tts_file, VOLUME_DB):
+        _tts_file = _tts_f
+
+    with speech_lock:
+        tts_file = _tts_file
+        speech_loaded = True
+    while True:
+        with speech_lock:
+            if not speech_loaded:
+                break
+        time.sleep(.01)
+
+
+def main_battery_check(prn_voltage: bool = False):
+    """
+    Check the main battery voltage and handle low battery situations.
+    """
+    if battery is None:
+        print("Battery check unavailable: no battery ADC was detected at startup.")
+        return None
+    try:
+        # Read the scaling voltage
+        # battery = SunfounderBattery(channel="A4")  
+        # # RoboHAT v4's documented battery ADC channel
+        voltage = round(battery.get_battery_voltage(), 2)
+        if prn_voltage:
+            print(f"Battery voltage: {voltage:.2f}V")
+    
+        # Check if the voltage is below the shutdown threshold
+        if voltage <= SHUTDOWN_VOLTAGE:
+            # Step 1: Emergency stop the robot motors
+            my_car.forward(MIN_MOTOR_SPEED)
+            my_car.stop()
+            
+            # Step 2: Play an audio alert
+            _speak_text("Battery critical. Shutting down now.")
+            time.sleep(3)
+            
+            # Step 3: Trigger Linux OS safe shutdown
+            os.system("sudo shutdown -h now")
+            
+        # Check if the voltage is below the warning threshold
+        elif voltage <= WARNING_VOLTAGE:
+            print(f"Warning: Low Battery! Voltage is {voltage}V")
+            _speak_text("Low battery. Please charge.")
+        
+    except Exception as exc:
+        print(f"Battery check error: {exc}")
+        return None
+    finally:
+        if 'voltage' in locals():
+            return voltage
+        return None
+
+
+def activate_keyboard_input():
+    # Voice command 't'/'type'/'keyboard' should drop straight into the WASD manual control
+    # loop, same as typing 'manual' at the input prompt, not the free-text GPT chat prompt.
+    manual_keyboard_loop()
+
 # Shared by keyboard 'manual' mode and voice commands so both dispatch identically.
 def _apply_manual_key(key):
     global motor_speed, dir_servo_angle, head_pan, head_tilt
@@ -1054,8 +1159,17 @@ def _apply_manual_key(key):
 
         elif key == 'l': # Move pan angle right
             head_pan = pan_head_right(head_pan)
-    elif key == 'r': # Reset Motor and Direction
-        motor_speed, dir_servo_angle = reset_motor_and_direction(DEFAULT_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE)
+    elif key in 'rvcbt':
+        if key == 'r': # Reset Motor and Direction
+            motor_speed, dir_servo_angle = reset_motor_and_direction(DEFAULT_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE)
+        elif key == 'v': # Activate voice input
+            activate_voice_input()
+        elif key == 'c': # Activate camera
+            activate_camera()
+        elif key == 'b': # Check battery
+            main_battery_check(True)
+        elif key == 't': # Manual input
+            activate_keyboard_input()
 
 
 
@@ -1072,6 +1186,10 @@ _VOICE_COMMAND_KEYS = {
     'k': ('center', 'center head', 'look straight', 'reset head'),
     'j': ('pan left', 'look left', 'pan head left'),
     'l': ('pan right', 'look right', 'pan head right'),
+    'v': ('voice input', 'activate voice input'),
+    'c': ('camera', 'activate camera', 'start camera'),
+    'b': ('battery check', 'check battery', 'battery status'),
+    't': ('manual input', 'type commands', 'keyboard', 'type')
 }
 
 def _match_voice_command_key(text):
@@ -1088,8 +1206,17 @@ def manual_keyboard_loop():
     print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, r= reset, i/m =tilt up|down, k =cntr, j/l =pan lt|rt, ctrl+c =exit")
 
     while True:
-        key = readchar.readkey().lower()
-        if key in ('wxsadrikmjl'):
+        main_battery_check(False)
+        try:
+            key = readchar.readkey().lower()
+        except KeyboardInterrupt:
+            # The real readchar library raises KeyboardInterrupt for Ctrl+C instead of
+            # returning it as a key, so readchar.key.CTRL_C below is unreachable dead code.
+            # Catch it here so Ctrl+C only exits this manual-control loop, not the whole script.
+            motor_speed, dir_servo_angle, head_pan, head_tilt = shutdown_gptcar()
+            return
+
+        if key in ('wxsadikmjlrvcbt'):
             _apply_manual_key(key)
 
         elif key == readchar.key.CTRL_C:
@@ -1097,6 +1224,8 @@ def manual_keyboard_loop():
             return
 
 
+
+        
 # main
 # =================================================================
 def main():
@@ -1106,6 +1235,7 @@ def main():
     global tts_file
     global input_mode
     global motor_speed, dir_servo_angle, head_pan, head_tilt
+    global last_time
 
     initialize_runtime()
     input_mode = _ensure_voice_or_keyboard_mode()
@@ -1115,12 +1245,14 @@ def main():
 
     speak_thread.start()
     action_thread.start()
+    last_time = time.time() 
 
     while True:
-        if input_mode == 'voice':
-            my_car.set_cam_pan_angle(DEFAULT_HEAD_PAN)
-            my_car.set_cam_tilt_angle(DEFAULT_HEAD_TILT)
+        # Check every pass so a low battery is caught regardless of which branch below
+        # runs (GPT dialogue, a direct voice/keyboard command, or manual WASD mode).
 
+        if input_mode == 'voice':
+            main_battery_check(False)
             # listen
             # ----------------------------------------------------------------
             gray_print("listening ...")
@@ -1200,8 +1332,6 @@ def main():
                 continue
 
         elif input_mode == 'keyboard':
-            my_car.set_cam_tilt_angle(DEFAULT_HEAD_TILT)
-
             with action_lock:
                 action_status = 'standby'
 
@@ -1217,6 +1347,11 @@ def main():
 
             if _result.lower() == 'chat':
                 print("Chat mode selected. Type your message to send to OpenAI.")
+                continue
+
+            if _result.lower() in ('t', 'voice'):
+                activate_voice_input()
+                gray_print("Switching to voice input.")
                 continue
 
         else:
@@ -1341,6 +1476,15 @@ if __name__ == "__main__":
         if with_img and 'Vilib' in globals():
             try:
                 Vilib.camera_close()
+                # camera_close() only flips a flag and sleeps 0.1s; it doesn't join the
+                # capture thread or wait for picamera2/libcamera to release the native
+                # camera pipeline. Exiting before that finishes can hit the native
+                # library mid-teardown, producing "terminate called without an active
+                # exception" from a background thread during interpreter shutdown.
+                camera_thread = getattr(Vilib, "camera_thread", None)
+                if camera_thread is not None and camera_thread.is_alive():
+                    camera_thread.join(timeout=2)
+                time.sleep(0.5)
             except Exception as exc:
                 print(f"Camera cleanup error: {exc}")
 
