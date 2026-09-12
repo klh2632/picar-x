@@ -1,6 +1,45 @@
 import os
+import importlib.util
+from pathlib import Path
 
-from gpt_examples import follow_human_face
+def _load_module_from_file(module_name, file_path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load module spec for {module_name} from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from gpt_examples import follow_human_face
+except Exception:
+    try:
+        import follow_human_face
+    except Exception:
+        follow_human_face = _load_module_from_file(
+            "follow_human_face",
+            Path(__file__).resolve().with_name("follow_human_face.py"),
+        )
+
+pretend_roomba = None
+_pretend_roomba_import_error = None
+try:
+    from gpt_examples import pretend_roomba
+except Exception as exc:
+    _pretend_roomba_import_error = exc
+    try:
+        from example import fauroomba as pretend_roomba
+    except Exception as exc2:
+        _pretend_roomba_import_error = exc2
+        try:
+            pretend_roomba = _load_module_from_file(
+                "pretend_roomba",
+                Path(__file__).resolve().parents[1] / "example" / "fauroomba.py",
+            )
+        except Exception as exc3:
+            _pretend_roomba_import_error = exc3
+            pretend_roomba = None
 
 from openai_helper import OpenAiHelper
 from keys import (
@@ -12,6 +51,7 @@ from keys import (
 from preset_actions import *
 from utils import *
 
+SOUND_EFFECT_ACTIONS = ()
 try:
     SOUND_EFFECT_ACTIONS
 except NameError:
@@ -23,6 +63,7 @@ VOLUME_DB = 3  # TTS post-gain in dB via sox; avoid exceeding 5 to prevent disto
 TTS_VOICE = 'nova'  # alloy, echo, fable, onyx, nova, or shimmer
 VOICE_INSTRUCTIONS = ""  # https://www.openai.fm/
 STT_NO_SPEECH_FILLER = "this is the conversation between me and a robot"
+VOICE_TIMEOUT_FALLBACK_COUNT = 6
 
 import readline # optimize keyboard input, only need to import
 
@@ -52,7 +93,6 @@ except ImportError:
 
 import speech_recognition as sr
 
-from pathlib import Path
 from contextlib import contextmanager
 import re
 import sys
@@ -873,13 +913,19 @@ MIN_HEAD_PAN = -55
 MAX_HEAD_TILT = 55
 MIN_HEAD_TILT = -55
 FOLLOW_HUMAN_FACE_DURATION = 60.0 # seconds
+ROOMBA_MODE_DURATION = 60.0 # seconds
+global follow_duration
 follow_duration=FOLLOW_HUMAN_FACE_DURATION
+global roomba_duration
+roomba_duration = ROOMBA_MODE_DURATION
 
-
+global motor_speed
 motor_speed = DEFAULT_MOTOR_SPEED   # initial motor speed
+global dir_servo_angle
 dir_servo_angle = DEFAULT_DIR_SERVO_ANGLE # initial direction
-
+global head_pan
 head_pan = DEFAULT_HEAD_PAN   # initial head pan angle
+global head_tilt    
 head_tilt = DEFAULT_HEAD_TILT # initial head tilt angle
 
 WARNING_VOLTAGE = 6.8  # Alert the user
@@ -1112,6 +1158,11 @@ def _follow_human_face(follow_duration: float = 60.0):
 
     return follow_human_face.follow_human_face(my_car, Vilib, _speak_text, follow_duration)
 
+def _pretend_roomba(roomba_duration: float = 60.0):
+    if pretend_roomba is None:
+        print(f"Pretend Roomba unavailable: {_pretend_roomba_import_error}")
+        return None
+    return pretend_roomba.pretend_roomba(my_car, Vilib, _speak_text, roomba_duration)
 
 def main_battery_check(prn_voltage: bool = False):
     """
@@ -1194,7 +1245,7 @@ def _apply_manual_key(key):
 
         elif key == 'l': # Move pan angle right
             head_pan = pan_head_right(head_pan)
-    elif key in 'rvcbtf':
+    elif key in 'rvcbtfp':
         if key == 'r': # Reset Motor and Direction
             motor_speed, dir_servo_angle = reset_motor_and_direction(DEFAULT_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE)
         elif key == 'v': # Activate voice input
@@ -1207,7 +1258,8 @@ def _apply_manual_key(key):
             activate_keyboard_input()
         elif key == 'f': # Follow human face for a duration
             _follow_human_face(follow_duration)
-
+        elif key == 'p': # Pretend Roomba mode
+            _pretend_roomba(roomba_duration)
 
 
 # Recognized speech that matches one of these phrases drives the car directly instead of going through GPT.
@@ -1226,8 +1278,9 @@ _VOICE_COMMAND_KEYS = {
     'v': ('voice input', 'activate voice input'),
     'c': ('camera', 'activate camera', 'start camera'),
     'b': ('battery check', 'check battery', 'battery status'),
-    't': ('manual input', 'type commands', 'keyboard', 'type'),
-    'f': ('follow face', 'follow the face', 'follow that face', 'follow human face', 'track face', 'track human face')
+    't': ('manual input', 'type commands', 'switch to keyboard', 'keyboard mode'),
+    'f': ('follow face', 'follow the face', 'follow that face', 'follow human face', 'track face', 'track human face'),
+    'p': ('pretend roomba', 'roomba mode', 'start roomba mode', 'activate roomba mode')
 }
 
 def _match_voice_command_key(text):
@@ -1255,7 +1308,7 @@ def manual_keyboard_loop():
     global motor_speed, dir_servo_angle, head_pan, head_tilt
     head_pan = DEFAULT_HEAD_PAN
     head_tilt = DEFAULT_HEAD_TILT
-    print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, r= reset, i/m =tilt up|down, k =cntr, j/l =pan lt|rt, ctrl+c =exit")
+    print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, r= reset, i/m =tilt up|down, k =cntr, j/l =pan lt|rt, p =pretend roomba, ctrl+c =exit")
 
     while True:
         main_battery_check(False)
@@ -1268,7 +1321,7 @@ def manual_keyboard_loop():
             motor_speed, dir_servo_angle, head_pan, head_tilt = shutdown_gptcar()
             return
 
-        if key in ('wxsadikmjlrvcbtf'):
+        if key in ('wxsadikmjlrvcbtfp'):
             _apply_manual_key(key)
 
         elif key == readchar.key.CTRL_C:
@@ -1297,6 +1350,7 @@ def main():
     speak_thread.start()
     action_thread.start()
     last_time = time.time() 
+    voice_timeout_streak = 0
 
     while True:
         # Check every pass so a low battery is caught regardless of which branch below
@@ -1356,6 +1410,16 @@ def main():
                         mic = None
 
             if timed_out:
+                voice_timeout_streak += 1
+                if voice_timeout_streak >= VOICE_TIMEOUT_FALLBACK_COUNT:
+                    print(
+                        f"No speech detected for {voice_timeout_streak} consecutive attempts; "
+                        "switching to keyboard mode. Say 'voice input' or type 'voice' to switch back."
+                    )
+                    input_mode = 'keyboard'
+                    voice_timeout_streak = 0
+                    print()
+                    continue
                 print("No speech detected; listening again.")
                 continue
 
@@ -1363,7 +1427,10 @@ def main():
                 print(f"Voice input unavailable for all capture candidates; falling back to keyboard input. Last error: {last_voice_error}")
                 _reset_capture_device_cache()
                 input_mode = 'keyboard'
+                voice_timeout_streak = 0
                 continue
+
+            voice_timeout_streak = 0
 
             # stt
             # ----------------------------------------------------------------
@@ -1385,8 +1452,8 @@ def main():
 
             voice_key = _match_voice_command_key(_result)
             if voice_key is not None:
-                _apply_manual_key(voice_key)
                 gray_print(f"Manual voice command: {_result!r} -> '{voice_key}'")
+                _apply_manual_key(voice_key)
                 continue
 
         elif input_mode == 'keyboard':

@@ -81,8 +81,13 @@ def speak_block(music, name, volume=100):
     is_run_with_root = (os.geteuid() == 0)
     if not is_run_with_root and not speak_first:
         speak_first = True
-        warn("Play sound needs to be run with sudo.")
-    _status, _ = run_command('sudo killall pulseaudio') # Solve the problem that there is no sound when running in the vnc environment
+        warn("Audio is running without root privileges; continuing without interactive sudo prompts.")
+
+    # Headless-safe: never block on a sudo password prompt.
+    if is_run_with_root:
+        run_command('killall pulseaudio')
+    else:
+        run_command('sudo -n killall pulseaudio')
     
     if os.path.isfile(name):
         music.sound_play(name, volume)
