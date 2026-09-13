@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 
 GRAY = '1;30'
 RED = '0;31'
@@ -52,7 +53,12 @@ def run_command(cmd):
     status = p.poll()
     return status, result
 
+
+_sox_module_missing_logged = False
+_sox_cli_missing_logged = False
+
 def sox_volume(input_file, output_file, volume):
+    global _sox_module_missing_logged, _sox_cli_missing_logged
     try:
         import sox
         transform = sox.Transformer()
@@ -61,8 +67,31 @@ def sox_volume(input_file, output_file, volume):
         transform.build(input_file, output_file)
 
         return True
+    except ModuleNotFoundError:
+        if not _sox_module_missing_logged:
+            _sox_module_missing_logged = True
+            print(
+                f"sox Python module not available for interpreter {sys.executable}; "
+                "trying system 'sox' CLI fallback."
+            )
     except Exception as e:
-        print(f"sox_volume err: {e}")
+        print(f"sox_volume python backend err: {e}")
+
+    try:
+        subprocess.run(
+            ["sox", input_file, output_file, "vol", f"{volume}dB"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except FileNotFoundError:
+        if not _sox_cli_missing_logged:
+            _sox_cli_missing_logged = True
+            print("sox CLI not found on PATH; volume adjustment disabled.")
+        return False
+    except Exception as e:
+        print(f"sox_volume cli backend err: {e}")
         return False
 
 
@@ -81,7 +110,6 @@ def speak_block(music, name, volume=100):
     is_run_with_root = (os.geteuid() == 0)
     if not is_run_with_root and not speak_first:
         speak_first = True
-        warn("Audio is running without root privileges; continuing without interactive sudo prompts.")
 
     # Headless-safe: never block on a sudo password prompt.
     if is_run_with_root:

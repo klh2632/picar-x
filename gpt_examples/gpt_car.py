@@ -1,6 +1,10 @@
 import os
 import importlib.util
 from pathlib import Path
+import json
+import wave
+import struct
+import math
 
 def _load_module_from_file(module_name, file_path):
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
@@ -58,12 +62,62 @@ except NameError:
     SOUND_EFFECT_ACTIONS = ()
 
 # STT/TTS config (see gpt_examples/README.md "Modify parameters")
-LANGUAGE = ['en','zh']  # e.g. ['zh', 'en']; empty list lets Whisper auto-detect all languages
-VOLUME_DB = 3  # TTS post-gain in dB via sox; avoid exceeding 5 to prevent distortion
+LANGUAGE = ['en']  # Keep a single language for faster STT turnaround in command-driving mode.
+VOLUME_DB = 0  # TTS post-gain in dB via sox; keep 0 by default to avoid clipping/loud jumps
 TTS_VOICE = 'nova'  # alloy, echo, fable, onyx, nova, or shimmer
 VOICE_INSTRUCTIONS = ""  # https://www.openai.fm/
 STT_NO_SPEECH_FILLER = "this is the conversation between me and a robot"
 VOICE_TIMEOUT_FALLBACK_COUNT = 6
+VOICE_MIN_ENERGY_THRESHOLD = 35.0
+VOICE_MAX_ENERGY_THRESHOLD = 95.0
+VOICE_TIMEOUT_BACKOFF = 0.7
+VOICE_LISTEN_TIMEOUT_SEC = 4
+VOICE_PHRASE_TIME_LIMIT_SEC = 2.5
+VOICE_LISTEN_CUE_ENABLED = True
+VOICE_LISTEN_START_BEEPS = 1
+VOICE_LISTEN_END_BEEPS = 2
+VOICE_LISTEN_BEEP_GAP_SEC = 0.12
+VOICE_LISTEN_BEEP_FREQ_HZ = 880
+VOICE_LISTEN_BEEP_DURATION_SEC = 0.06
+VOICE_POST_COMMAND_COOLDOWN_SEC = 1.0
+VOICE_POST_MOTION_COOLDOWN_SEC = 0.15
+VOICE_MAX_REPEAT_STEPS = 4
+VOICE_REPEATABLE_INCREMENT_KEYS = ('w', 'x', 'a', 'd', 'i', 'm', 'j', 'l')
+# Throttle hold timeout for voice forward/backward. Set to 0 to keep moving
+# until an explicit stop/reset command is spoken.
+VOICE_THROTTLE_FAILSAFE_SEC = 0.0
+VOICE_MODE_CHAT_ENABLED = False
+OFFLINE_COMMAND_STT_ENABLED = True
+OPENAI_STT_FALLBACK_WHEN_OFFLINE_MISS = False
+OPENAI_MODE_SWITCH_FALLBACK = True
+OFFLINE_COMMAND_KEYWORD_WEIGHT = 1e-18
+OFFLINE_USE_KEYWORD_SPOTTING = False
+OFFLINE_SECOND_PASS_KEYWORD_SPOTTING = False
+OFFLINE_CRITICAL_COMMAND_SPOTTING = False
+OFFLINE_CRITICAL_KEYWORD_WEIGHT = 1e-20
+OFFLINE_STT_ENGINE = "vosk"  # "vosk" or "pocketsphinx"
+OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK = True
+VOSK_MODEL_PATH = os.environ.get("PICARX_VOSK_MODEL_PATH", "./vosk-model-small-en-us-0.15")
+VOSK_SAMPLE_RATE = 16000
+VOICE_VERBOSE_LOGS = False
+OFFLINE_MAX_COMMAND_TOKENS = 5
+OFFLINE_MAX_COMMAND_UNIQUE_TOKENS = 3
+OFFLINE_MAX_NOISY_LOG_CHARS = 140
+VOICE_REQUIRE_WAKE_WORD_FOR_CHAT = True
+VOICE_CHAT_WAKE_WORDS = ("assistant", "pie car", "pai car","piecar", "piecar x", "paicar x")
+TTS_PLAYBACK_VOLUME = None  # None means read current ALSA mixer volume dynamically
+TTS_PLAYBACK_VOLUME_FALLBACK = 30
+ENABLE_THINK_GESTURE = False
+LOCAL_TTS_ENABLED_FOR_ZEN = True
+ZEN_LOCAL_PLAYBACK_TIMEOUT_SEC = 15
+
+ZEN_THOUGHTS = (
+    "Breathe in, breathe out. Small steps still move you forward.",
+    "The wheel turns best when we do one thing at a time.",
+    "A steady path beats a fast zigzag.",
+    "Quiet sensors, clear choices, smooth motion.",
+    "I'm sorry Dave, I'm afraid I can't do that.",
+)
 
 import readline # optimize keyboard input, only need to import
 
@@ -856,6 +910,10 @@ self.non_speaking_duration = 0.5  # seconds of non-speaking audio to keep on bot
 recognizer = sr.Recognizer()
 recognizer.dynamic_energy_adjustment_damping = 0.16
 recognizer.dynamic_energy_ratio = 1.6
+# Dynamic thresholding can climb too high on this drivetrain/camera noise profile
+# and then reject normal speech for many consecutive turns.
+recognizer.dynamic_energy_threshold = False
+recognizer.energy_threshold = 70
 
 # speak_hanlder
 # =================================================================
@@ -868,15 +926,49 @@ speech_lock = threading.Lock()
 global tts_file
 tts_file = None
 
+
+def _resolve_tts_playback_volume(default=TTS_PLAYBACK_VOLUME_FALLBACK):
+    """Resolve playback volume from ALSA mixer percentage (0-100).
+
+    Falls back to a safe default when amixer is unavailable or cannot be parsed.
+    """
+    if isinstance(TTS_PLAYBACK_VOLUME, int):
+        return max(0, min(100, TTS_PLAYBACK_VOLUME))
+
+    for control in ("Speaker", "Master", "PCM"):
+        try:
+            proc = subprocess.run(
+                ["amixer", "get", control],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=1,
+            )
+            output = proc.stdout or ""
+            match = re.search(r"\[(\d{1,3})%\]", output)
+            if match:
+                return max(0, min(100, int(match.group(1))))
+        except Exception:
+            continue
+
+    return max(0, min(100, default))
+
 def speak_hanlder():
     global speech_loaded, tts_file
     while True:
-        with speech_lock:
-            _isloaded = speech_loaded
-        if _isloaded:
-            # gray_print('speak start')
-            speak_block(music, tts_file)
-            # gray_print('speak done')
+        try:
+            with speech_lock:
+                _isloaded = speech_loaded
+            if _isloaded:
+                # gray_print('speak start')
+                speak_block(music, tts_file, _resolve_tts_playback_volume())
+                # gray_print('speak done')
+                with speech_lock:
+                    speech_loaded = False
+        except Exception as exc:
+            # Never let the speech worker die; otherwise callers waiting on
+            # speech_loaded can block indefinitely and freeze manual input flow.
+            print(f"speak_hanlder error: {exc}")
             with speech_lock:
                 speech_loaded = False
         time.sleep(0.05)
@@ -999,8 +1091,9 @@ def action_handler():
         elif _state == 'think':
             if last_action_status != 'think':
                 last_action_status = 'think'
-                # think(my_car)
-                keep_think(my_car)
+                if ENABLE_THINK_GESTURE:
+                    # Optional decorative gesture while waiting on GPT response.
+                    keep_think(my_car)
         elif _state == 'actions':
             last_action_status = 'actions'
             with action_lock:
@@ -1142,14 +1235,149 @@ def _speak_text(text) -> None:
     if not sox_volume(_tts_f, _tts_file, VOLUME_DB):
         _tts_file = _tts_f
 
+    _play_tts_file_and_wait(_tts_file)
+
+
+def _play_tts_file_and_wait(audio_file):
+    global tts_file, speech_loaded
     with speech_lock:
-        tts_file = _tts_file
+        tts_file = audio_file
         speech_loaded = True
+
+    wait_started = time.time()
     while True:
         with speech_lock:
             if not speech_loaded:
                 break
+        if time.time() - wait_started > SPEECH_WAIT_TIMEOUT_SEC:
+            print("Local TTS wait timeout; clearing speech flag and continuing.")
+            with speech_lock:
+                speech_loaded = False
+            break
         time.sleep(.01)
+
+
+def _synthesize_local_tts_wav(text, output_wav):
+    engines = (
+        ["espeak-ng", "-w", output_wav, text],
+        ["espeak", "-w", output_wav, text],
+        ["pico2wave", "-w", output_wav, text],
+    )
+    for cmd in engines:
+        try:
+            proc = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if proc.returncode == 0 and os.path.isfile(output_wav) and os.path.getsize(output_wav) > 0:
+                return True
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return False
+
+
+def _speak_text_local(text):
+    os.makedirs("./tts", exist_ok=True)
+    local_stamp = f"{time.strftime('%y-%m-%d_%H-%M-%S', time.localtime())}_{int(time.time() * 1000) % 1000:03d}"
+    local_raw = f"./tts/{local_stamp}_local_raw.wav"
+    if not _synthesize_local_tts_wav(text, local_raw):
+        return False
+
+    local_out = f"./tts/{local_stamp}_local_{VOLUME_DB}dB.wav"
+    if not sox_volume(local_raw, local_out, VOLUME_DB):
+        local_out = local_raw
+
+    if _play_wav_with_aplay(local_out):
+        return True
+
+    # Fallback to the existing music worker path if direct ALSA playback is unavailable.
+    _play_tts_file_and_wait(local_out)
+    return True
+
+
+def _play_wav_with_aplay(audio_file):
+    if not os.path.isfile(audio_file):
+        return False
+
+    aplay_path = None
+    for candidate in ("/usr/bin/aplay", "aplay"):
+        try:
+            probe = subprocess.run([candidate, "--version"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == 0:
+                aplay_path = candidate
+                break
+        except Exception:
+            continue
+
+    if aplay_path is None:
+        return False
+
+    device = os.environ.get("PICARX_AUDIODEV") or os.environ.get("AUDIODEV")
+    cmd = [aplay_path, "-q"]
+    if device:
+        cmd.extend(["-D", device])
+    cmd.append(audio_file)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=ZEN_LOCAL_PLAYBACK_TIMEOUT_SEC,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+_listen_beep_wav = None
+
+
+def _ensure_listen_beep_wav():
+    global _listen_beep_wav
+    if _listen_beep_wav and os.path.isfile(_listen_beep_wav):
+        return _listen_beep_wav
+
+    os.makedirs("./tts", exist_ok=True)
+    beep_path = "./tts/listen_beep.wav"
+    sample_rate = 16000
+    samples = max(1, int(VOICE_LISTEN_BEEP_DURATION_SEC * sample_rate))
+    amplitude = 9000
+
+    try:
+        with wave.open(beep_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            for i in range(samples):
+                env = 1.0 - (i / samples)
+                value = int(amplitude * env * math.sin(2.0 * math.pi * VOICE_LISTEN_BEEP_FREQ_HZ * i / sample_rate))
+                wav_file.writeframesraw(struct.pack("<h", value))
+
+        _listen_beep_wav = beep_path
+        return _listen_beep_wav
+    except Exception:
+        return None
+
+
+def _play_listen_beeps(count):
+    if not VOICE_LISTEN_CUE_ENABLED or count <= 0:
+        return
+
+    beep_path = _ensure_listen_beep_wav()
+    if not beep_path:
+        return
+
+    for idx in range(count):
+        played = _play_wav_with_aplay(beep_path)
+        if not played:
+            try:
+                # Fallback to robot_hat audio path when direct aplay output is unavailable.
+                music.sound_play(beep_path, _resolve_tts_playback_volume())
+            except Exception:
+                pass
+        if idx < count - 1:
+            time.sleep(VOICE_LISTEN_BEEP_GAP_SEC)
 
 def _follow_human_face(follow_duration: float = 60.0):
     if 'Vilib' not in globals() or Vilib is None:
@@ -1163,6 +1391,21 @@ def _pretend_roomba(roomba_duration: float = 60.0):
         print(f"Pretend Roomba unavailable: {_pretend_roomba_import_error}")
         return None
     return pretend_roomba.pretend_roomba(my_car, Vilib, _speak_text, roomba_duration)
+
+
+def _wiggle_gesture():
+    """Run a brief local 'thinking' gesture on-demand."""
+    keep_think(my_car)
+
+
+def _offer_zen_thought():
+    """Speak a short local Zen line without calling GPT dialogue."""
+    zen_text = random.choice(ZEN_THOUGHTS)
+    if LOCAL_TTS_ENABLED_FOR_ZEN and _speak_text_local(zen_text):
+        return
+    if LOCAL_TTS_ENABLED_FOR_ZEN:
+        print("Zen local TTS unavailable; falling back to OpenAI TTS.")
+    _speak_text(zen_text)
 
 def main_battery_check(prn_voltage: bool = False):
     """
@@ -1245,7 +1488,7 @@ def _apply_manual_key(key):
 
         elif key == 'l': # Move pan angle right
             head_pan = pan_head_right(head_pan)
-    elif key in 'rvcbtfp':
+    elif key in 'rvcbtfpzg':
         if key == 'r': # Reset Motor and Direction
             motor_speed, dir_servo_angle = reset_motor_and_direction(DEFAULT_MOTOR_SPEED, DEFAULT_DIR_SERVO_ANGLE)
         elif key == 'v': # Activate voice input
@@ -1260,15 +1503,19 @@ def _apply_manual_key(key):
             _follow_human_face(follow_duration)
         elif key == 'p': # Pretend Roomba mode
             _pretend_roomba(roomba_duration)
+        elif key == 'z': # Speak a Zen thought
+            _offer_zen_thought()
+        elif key == 'g': # Run a wiggle gesture
+            _wiggle_gesture()
 
 
 # Recognized speech that matches one of these phrases drives the car directly instead of going through GPT.
 _VOICE_COMMAND_KEYS = {
     'w': ('forward', 'go forward', 'move forward', 'drive forward'),
-    'x': ('backward', 'back up', 'go backward', 'move backward', 'reverse'),
+    'x': ('backward', 'back up', 'go backward', 'move backward', 'go back', 'move back', 'reverse'),
     'a': ('left', 'turn left', 'left turn','steer left', 'go left'),
     'd': ('right', 'turn right', 'right turn', 'steer right', 'go right'),
-    's': ('stop', 'halt', 'brake'),
+    's': ('stop', 'halt', 'brake', 'quit', 'exit', 'cancel'),
     'r': ('reset', 'reset car', 'reset motor', 'reset direction'),
     'i': ('tilt up', 'look up', 'head up', 'tilt head up'),
     'm': ('tilt down', 'look down', 'head down', 'tilt head down'),
@@ -1280,35 +1527,542 @@ _VOICE_COMMAND_KEYS = {
     'b': ('battery check', 'check battery', 'battery status'),
     't': ('manual input', 'type commands', 'switch to keyboard', 'keyboard mode'),
     'f': ('follow face', 'follow the face', 'follow that face', 'follow human face', 'track face', 'track human face'),
-    'p': ('pretend roomba', 'roomba mode', 'start roomba mode', 'activate roomba mode')
+    'p': ('pretend roomba', 'roomba mode', 'start roomba mode', 'activate roomba mode'),
+    'z': ('zen', 'zen thought', 'offer zen thought', 'offer zen thoughts', 'ai offer zen thoughts'),
+    # Keep wiggle intentionally strict so random single-token STT noise does not trigger gestures.
+    'g': ('do a wiggle', 'wiggle gesture', 'start wiggle mode')
 }
 
+# Common Whisper one-word mis-hearings seen on this stack.
+_VOICE_COMMAND_ALIASES = {
+    "for a word": "forward",
+    "for word": "forward",
+    "forwards": "forward",
+    "go for": "go forward",
+    "go four": "go forward",
+    "back word": "backward",
+    "backwards": "backward",
+    "back": "backward",
+    "wright": "right",
+    "rite": "right",
+    "pen": "pan",
+    "lift": "left",
+    "break": "brake",
+    "quite": "quit",
+    "quick": "quit",
+    "ex it": "exit",
+    "centered": "center",
+    "sen": "zen",
+    "send": "zen",
+}
+
+_VOICE_SINGLE_WORD_KEYS = {
+    "forward": "w",
+    "backward": "x",
+    "left": "a",
+    "right": "d",
+    "stop": "s",
+    "halt": "s",
+    "brake": "s",
+    "quit": "s",
+    "exit": "s",
+    "cancel": "s",
+    "reset": "r",
+    "up": "i",
+    "down": "m",
+    "center": "k",
+    "voice": "v",
+    "camera": "c",
+    "battery": "b",
+    "manual": "t",
+    "keyboard": "t",
+    "face": "f",
+    "roomba": "p",
+    "zen": "z",
+    "wiggle": "g",
+}
+
+
+def _should_ignore_voice_text(text, had_recent_timeouts=False):
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return True
+
+    if normalized == STT_NO_SPEECH_FILLER:
+        return True
+
+    tokens = normalized.split()
+
+    # Ignore short non-command snippets that are commonly produced by noise,
+    # breath, or clipping after listen timeout cycles.
+    short_limit = 5 if had_recent_timeouts else 2
+    if len(tokens) <= short_limit:
+        if _match_voice_command_key(normalized) is None:
+            return True
+
+    return False
+
+
+def _has_chat_wake_word(text):
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    for wake_word in VOICE_CHAT_WAKE_WORDS:
+        if wake_word in normalized:
+            return True
+    return False
+
+
+def _normalize_command_text(text):
+    normalized = str(text or '').strip().lower()
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return "", []
+
+    # First pass allows exact phrase remaps, then per-token remaps for homophones.
+    normalized = _VOICE_COMMAND_ALIASES.get(normalized, normalized)
+    tokens = [_VOICE_COMMAND_ALIASES.get(tok, tok) for tok in normalized.split()]
+    return " ".join(tokens), tokens
+
 def _match_voice_command_key(text):
-    normalized = re.sub(r"\s+", " ", str(text or '').strip().lower().rstrip('.!?'))
+    normalized, tokens = _normalize_command_text(text)
+
+    if not normalized:
+        return None
+
+    if not tokens:
+        return None
+
+    # Keep wiggle available as an explicit one-word command only.
+    if normalized == "wiggle":
+        return 'g'
+
+    # Zen should be easy to trigger in command-only mode without over-matching
+    # random keyword soup from offline recognizers.
+    if tokens[0] == "zen":
+        return 'z'
 
     # Prefer local face-follow control for natural phrasings such as
     # "follow that face" or "can you track the face".
     if "face" in normalized and ("follow" in normalized or "track" in normalized):
         return 'f'
 
+    # Single-word commands are common in noisy environments; check these early
+    # before broader phrase containment logic.
+    if len(tokens) == 1:
+        single = tokens[0]
+        if single in _VOICE_SINGLE_WORD_KEYS:
+            return _VOICE_SINGLE_WORD_KEYS[single]
+
+    # Prefer exact phrase matches before token-level shortcuts so commands like
+    # "pan left"/"pan right" are routed to camera pan instead of steering.
     for key, phrases in _VOICE_COMMAND_KEYS.items():
         if normalized in phrases:
             return key
+
+    # Handle emphatic repeats like "right right right" or "stop stop".
+    if len(tokens) >= 2 and len(set(tokens)) == 1:
+        repeated = tokens[0]
+        if repeated in _VOICE_SINGLE_WORD_KEYS:
+            return _VOICE_SINGLE_WORD_KEYS[repeated]
+
+    if len(tokens) == 2:
+        mapped = [(idx, _VOICE_SINGLE_WORD_KEYS.get(tok)) for idx, tok in enumerate(tokens)]
+        mapped = [(idx, key) for idx, key in mapped if key is not None]
+        if len(mapped) == 2 and mapped[0][1] == mapped[1][1]:
+            return mapped[0][1]
+        if len(mapped) == 1:
+            other_idx = 1 - mapped[0][0]
+            other_token = tokens[other_idx]
+            if other_token in ("go", "move", "turn", "drive", "please"):
+                return mapped[0][1]
 
     # Graceful fallback: allow phrase containment for longer commands
     # like "please go forward" without requiring exact equality.
     for key, phrases in _VOICE_COMMAND_KEYS.items():
         for phrase in phrases:
-            if phrase and phrase in normalized:
+            if not phrase:
+                continue
+            # Avoid over-matching on single words such as "right" or "manual".
+            if " " not in phrase:
+                continue
+            if phrase in normalized:
                 return key
 
     return None
+
+
+def _voice_command_repeat_steps(text, matched_key):
+    """Map repeated token commands (e.g. 'right right right') to repeated key steps."""
+    normalized, tokens = _normalize_command_text(text)
+    if not normalized or not matched_key:
+        return 1
+
+    # Incremental controls support repeated-step accumulation.
+    if matched_key not in VOICE_REPEATABLE_INCREMENT_KEYS:
+        return 1
+
+    if len(tokens) >= 2 and len(set(tokens)) == 1:
+        repeated_token = tokens[0]
+        token_key = _VOICE_SINGLE_WORD_KEYS.get(repeated_token)
+        if token_key == matched_key:
+            return min(len(tokens), VOICE_MAX_REPEAT_STEPS)
+
+    # Support repeated multi-word phrase commands, e.g. "pan right pan right".
+    phrases = _VOICE_COMMAND_KEYS.get(matched_key, ())
+    phrase_repeat = 1
+    for phrase in phrases:
+        if " " not in phrase:
+            continue
+        count = len(re.findall(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", normalized))
+        if count > phrase_repeat:
+            phrase_repeat = count
+
+    return min(phrase_repeat, VOICE_MAX_REPEAT_STEPS)
+
+
+_vosk_model_cache = None
+_vosk_model_missing_logged = False
+_vosk_model_load_error_logged = False
+
+
+def _voice_debug(msg):
+    if VOICE_VERBOSE_LOGS:
+        gray_print(msg)
+
+
+def _get_vosk_model():
+    global _vosk_model_cache, _vosk_model_missing_logged, _vosk_model_load_error_logged
+    if _vosk_model_cache is not None:
+        return _vosk_model_cache
+
+    model_path = Path(VOSK_MODEL_PATH).expanduser()
+    if not model_path.is_absolute():
+        model_path = (Path(__file__).resolve().parent / model_path).resolve()
+
+    if not model_path.is_dir():
+        if not _vosk_model_missing_logged:
+            _vosk_model_missing_logged = True
+            print(f"Vosk model not found at {model_path}; offline local STT unavailable.")
+        return None
+
+    try:
+        from vosk import Model, SetLogLevel
+
+        SetLogLevel(-1)
+
+        _vosk_model_cache = Model(str(model_path))
+        return _vosk_model_cache
+    except Exception as exc:
+        if not _vosk_model_load_error_logged:
+            _vosk_model_load_error_logged = True
+            print(f"Unable to load Vosk model at {model_path}: {exc}")
+        return None
+
+
+def _offline_command_stt_vosk(audio):
+    model = _get_vosk_model()
+    if model is None:
+        return None
+
+    phrases = [
+        "forward",
+        "go forward",
+        "move forward",
+        "backward",
+        "back up",
+        "go back",
+        "move back",
+        "reverse",
+        "left",
+        "turn left",
+        "go left",
+        "right",
+        "turn right",
+        "go right",
+        "stop",
+        "halt",
+        "brake",
+        "quit",
+        "exit",
+        "cancel",
+        "reset",
+        "tilt up",
+        "look up",
+        "head up",
+        "tilt down",
+        "look down",
+        "head down",
+        "pan left",
+        "pan right",
+        "look left",
+        "look right",
+        "center",
+        "center head",
+        "reset head",
+        "keyboard",
+        "manual",
+        "voice",
+        "camera",
+        "battery",
+        "face",
+        "follow face",
+        "pretend roomba",
+        "zen",
+        "wiggle",
+        "wiggle gesture",
+        "do a wiggle",
+    ]
+    grammar = json.dumps(phrases)
+
+    try:
+        from vosk import KaldiRecognizer
+
+        raw = audio.get_raw_data(convert_rate=VOSK_SAMPLE_RATE, convert_width=2)
+        rec = KaldiRecognizer(model, VOSK_SAMPLE_RATE, grammar)
+        rec.SetWords(False)
+        rec.AcceptWaveform(raw)
+
+        result = json.loads(rec.Result() or "{}")
+        text = str(result.get("text") or "").strip()
+        if text:
+            return text
+
+        final = json.loads(rec.FinalResult() or "{}")
+        return str(final.get("text") or "").strip() or None
+    except Exception as exc:
+        print(f"Offline STT error (vosk): {exc}")
+        return None
+
+
+def _offline_command_stt_pocketsphinx(audio):
+    # Keep the previous PocketSphinx path as an optional fallback engine.
+    if OFFLINE_CRITICAL_COMMAND_SPOTTING:
+        critical_keywords = [
+            ("stop", OFFLINE_CRITICAL_KEYWORD_WEIGHT),
+            ("halt", OFFLINE_CRITICAL_KEYWORD_WEIGHT),
+            ("brake", OFFLINE_CRITICAL_KEYWORD_WEIGHT),
+            ("keyboard", OFFLINE_CRITICAL_KEYWORD_WEIGHT),
+            ("manual", OFFLINE_CRITICAL_KEYWORD_WEIGHT),
+        ]
+        try:
+            critical_result = recognizer.recognize_sphinx(audio, keyword_entries=critical_keywords).strip()
+            if critical_result:
+                normalized, tokens = _normalize_command_text(critical_result)
+                critical_tokens = [t for t in tokens if t in ("stop", "halt", "brake", "keyboard", "manual")]
+                if critical_tokens:
+                    return " ".join(critical_tokens)
+                if normalized:
+                    return normalized
+        except sr.UnknownValueError:
+            pass
+        except Exception:
+            pass
+
+    if not OFFLINE_USE_KEYWORD_SPOTTING:
+        try:
+            first_pass = recognizer.recognize_sphinx(audio).strip()
+            if first_pass:
+                normalized, _ = _normalize_command_text(first_pass)
+                if normalized:
+                    return normalized
+        except sr.UnknownValueError:
+            pass
+        except Exception as exc:
+            print(f"Offline STT error: {exc}")
+            pass
+
+        if not OFFLINE_SECOND_PASS_KEYWORD_SPOTTING:
+            return None
+
+    keyword_entries = []
+    for phrase in (
+        "forward",
+        "go forward",
+        "backward",
+        "left",
+        "right",
+        "stop",
+        "halt",
+        "brake",
+        "reset",
+        "face",
+        "follow face",
+        "zen",
+        "wiggle",
+        "pretend roomba",
+    ):
+        keyword_entries.append((phrase, OFFLINE_COMMAND_KEYWORD_WEIGHT))
+
+    try:
+        return recognizer.recognize_sphinx(audio, keyword_entries=keyword_entries).strip()
+    except sr.UnknownValueError:
+        return None
+    except Exception as exc:
+        print(f"Offline STT error: {exc}")
+        return None
+
+
+def _offline_command_stt(audio):
+    """Fast local STT path for command driving; returns transcript text or None."""
+    if not OFFLINE_COMMAND_STT_ENABLED:
+        return None
+
+    if OFFLINE_STT_ENGINE == "vosk":
+        result = _offline_command_stt_vosk(audio)
+        if result:
+            return result
+        if OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK:
+            return _offline_command_stt_pocketsphinx(audio)
+        return None
+
+    return _offline_command_stt_pocketsphinx(audio)
+
+
+def _offline_transcript_is_noisy(text):
+    """Drop long mixed-keyword hypotheses that are not actionable command phrases."""
+    normalized, tokens = _normalize_command_text(text)
+    if not normalized:
+        return True
+
+    # In voice mode, pure "voice" utterances are not actionable and often come from
+    # recognizer feedback loops, so always discard them.
+    if all(token == "voice" for token in tokens):
+        return True
+
+    # Repeated identical commands are valid for short control phrases.
+    if len(tokens) >= 2 and len(set(tokens)) == 1:
+        key = _VOICE_SINGLE_WORD_KEYS.get(tokens[0])
+        if key is not None:
+            # Keep repeated motion commands bounded; reject long spam bursts.
+            if key in ('w', 'x','s', 'a', 'd') and len(tokens) > VOICE_MAX_REPEAT_STEPS:
+                return True
+            # Non-motion repeats like "voice voice voice ..." are usually decoder loops.
+            if key not in ('w', 'x','s', 'a', 'd') and len(tokens) > 2:
+                return True
+            return False
+
+    if len(tokens) > OFFLINE_MAX_COMMAND_TOKENS:
+        return True
+
+    if len(set(tokens)) > OFFLINE_MAX_COMMAND_UNIQUE_TOKENS:
+        return True
+
+    # Reject mixed-intent transcripts (e.g. "up face voice down right zen") that are
+    # recognizer hypotheses rather than a single actionable user command.
+    mapped_keys = []
+    for token in tokens:
+        token_key = _VOICE_SINGLE_WORD_KEYS.get(token)
+        if token_key is not None:
+            mapped_keys.append(token_key)
+    if len(set(mapped_keys)) > 1:
+        return True
+
+    return False
+
+
+def _shorten_for_log(text, max_chars=OFFLINE_MAX_NOISY_LOG_CHARS):
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + " ..."
+
+
+def _collapse_offline_hypothesis(text):
+    """Collapse repeated/mixed same-intent tokens into one actionable command phrase."""
+    normalized, tokens = _normalize_command_text(text)
+    if not normalized:
+        return normalized
+
+    mapped_keys = []
+    unmapped_tokens = []
+    for token in tokens:
+        key = _VOICE_SINGLE_WORD_KEYS.get(token)
+        if key is not None:
+            mapped_keys.append(key)
+        else:
+            unmapped_tokens.append(token)
+
+    if not mapped_keys:
+        return normalized
+
+    # Only collapse when non-command tokens are harmless filler words.
+    # This preserves intent phrases like "pan left" and "look right" so
+    # they can still match camera commands downstream.
+    collapse_fillers = {"go", "move", "turn", "drive", "please", "the", "a", "to"}
+    if any(token not in collapse_fillers for token in unmapped_tokens):
+        return normalized
+
+    # If recognizer outputs variants that all map to STOP, keep one canonical stop.
+    if len(set(mapped_keys)) == 1:
+        key = mapped_keys[0]
+        canonical_by_key = {
+            'w': 'forward',
+            'x': 'backward',
+            'a': 'left',
+            'd': 'right',
+            's': 'stop',
+            'r': 'reset',
+            't': 'keyboard',
+            'v': 'voice',
+            'f': 'face',
+            'p': 'roomba',
+            'z': 'zen',
+            'g': 'wiggle',
+            'i': 'up',
+            'm': 'down',
+            'k': 'center',
+            'j': 'left',
+            'l': 'right',
+            'b': 'battery',
+            'c': 'camera',
+        }
+        canonical = canonical_by_key.get(key)
+        if not canonical:
+            return normalized
+
+        if key in ('w', 'x', 'a', 'd'):
+            repeat = min(len(mapped_keys), VOICE_MAX_REPEAT_STEPS)
+            return " ".join([canonical] * repeat)
+
+        return canonical
+
+    return normalized
+
+
+def _try_openai_mode_fallback(audio, had_recent_timeouts=False):
+    """Use cloud STT only for low-frequency control intents (mode switch and stop)."""
+    if not OPENAI_MODE_SWITCH_FALLBACK:
+        return None, None
+
+    st = time.time()
+    candidate = openai_helper.stt(audio, language=LANGUAGE)
+    _voice_debug(f"openai fallback stt takes: {time.time() - st:.3f} s")
+
+    if not isinstance(candidate, str):
+        return None, None
+
+    candidate = candidate.strip()
+    if not candidate:
+        return None, None
+
+    if _should_ignore_voice_text(candidate, had_recent_timeouts=had_recent_timeouts):
+        return None, None
+
+    key = _match_voice_command_key(candidate)
+    if key in ('t', 'v', 's'):
+        return candidate, key
+
+    return None, None
 
 def manual_keyboard_loop():
     global motor_speed, dir_servo_angle, head_pan, head_tilt
     head_pan = DEFAULT_HEAD_PAN
     head_tilt = DEFAULT_HEAD_TILT
-    print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, r= reset, i/m =tilt up|down, k =cntr, j/l =pan lt|rt, p =pretend roomba, ctrl+c =exit")
+    print("\nManual: w/x =fwd|bk s =stop, a/d =lt|rt, r= reset, i/m =tilt up|down,\n k =cntr, j/l =pan lt|rt, p =roomba, f =face, z =zen, g =wiggle, ctrl+c =exit")
 
     while True:
         main_battery_check(False)
@@ -1321,7 +2075,7 @@ def manual_keyboard_loop():
             motor_speed, dir_servo_angle, head_pan, head_tilt = shutdown_gptcar()
             return
 
-        if key in ('wxsadikmjlrvcbtfp'):
+        if key in ('wxsadikmjlrvcbtfpzg'):
             _apply_manual_key(key)
 
         elif key == readchar.key.CTRL_C:
@@ -1344,6 +2098,18 @@ def main():
     initialize_runtime()
     input_mode = _ensure_voice_or_keyboard_mode()
 
+    if OFFLINE_COMMAND_STT_ENABLED:
+        mode_msg = f"Voice command STT mode: local {OFFLINE_STT_ENGINE} primary"
+        if OFFLINE_STT_ENGINE == "vosk" and OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK:
+            mode_msg += ", PocketSphinx fallback"
+        if OPENAI_MODE_SWITCH_FALLBACK:
+            mode_msg += ", OpenAI mode-switch fallback enabled"
+        else:
+            mode_msg += ", OpenAI fallback disabled"
+        print(mode_msg + ".")
+    else:
+        print("Voice command STT mode: OpenAI primary.")
+
     my_car.reset()
     my_car.set_cam_tilt_angle(DEFAULT_HEAD_TILT)
 
@@ -1351,6 +2117,8 @@ def main():
     action_thread.start()
     last_time = time.time() 
     voice_timeout_streak = 0
+    voice_command_cooldown_until = 0.0
+    voice_motion_failsafe_until = 0.0
 
     while True:
         # Check every pass so a low battery is caught regardless of which branch below
@@ -1358,6 +2126,17 @@ def main():
 
         if input_mode == 'voice':
             main_battery_check(False)
+
+            if voice_motion_failsafe_until > 0 and time.time() >= voice_motion_failsafe_until and motor_speed > MIN_MOTOR_SPEED:
+                motor_speed = stop_car()
+                voice_motion_failsafe_until = 0.0
+                gray_print("Voice motion failsafe: auto-stop while waiting for next command.")
+
+            if voice_command_cooldown_until > time.time():
+                time.sleep(0.05)
+                continue
+
+            _play_listen_beeps(VOICE_LISTEN_START_BEEPS)
             # listen
             # ----------------------------------------------------------------
             gray_print("listening ...")
@@ -1383,17 +2162,34 @@ def main():
                     _stderr_back = redirect_error_2_null() # ignore ALSA chatter while probing capture devices
                     mic = _open_microphone_for_listen(mic_device_index)
                     cancel_redirect_error(_stderr_back)
-                    recognizer.adjust_for_ambient_noise(mic)
+                    # Calibrate once when entering a fresh listen cycle, then clamp tightly so
+                    # ambient spikes don't make the listener effectively deaf.
+                    if voice_timeout_streak == 0 and attempt_index == 0:
+                        recognizer.adjust_for_ambient_noise(mic, duration=0.2)
+                    recognizer.energy_threshold = max(
+                        VOICE_MIN_ENERGY_THRESHOLD,
+                        min(float(recognizer.energy_threshold), VOICE_MAX_ENERGY_THRESHOLD),
+                    )
                     # Motor/drivetrain noise from a moving car can spike the dynamically adjusted
                     # threshold (seen climbing past 1700+ after several 'forward' commands), which
                     # then keeps voice from ever clearing it. Cap it so a noisy moment doesn't stick.
-                    recognizer.energy_threshold = min(recognizer.energy_threshold, 600)
-                    print(f"Say something now (listening for up to 10s, energy_threshold={recognizer.energy_threshold:.1f})...")
-                    audio = recognizer.listen(mic, timeout=10, phrase_time_limit=15)
+                    print(
+                        f"Say something now (listening for up to {VOICE_LISTEN_TIMEOUT_SEC}s, "
+                        f"energy_threshold={recognizer.energy_threshold:.1f})..."
+                    )
+                    audio = recognizer.listen(
+                        mic,
+                        timeout=VOICE_LISTEN_TIMEOUT_SEC,
+                        phrase_time_limit=VOICE_PHRASE_TIME_LIMIT_SEC,
+                    )
                     break
                 except sr.WaitTimeoutError:
                     # No speech detected within the timeout; the mic itself is fine, so retry listening
                     # instead of falling back to keyboard input.
+                    recognizer.energy_threshold = max(
+                        VOICE_MIN_ENERGY_THRESHOLD,
+                        float(recognizer.energy_threshold) * VOICE_TIMEOUT_BACKOFF,
+                    )
                     print(f"Timed out waiting for speech above energy_threshold={recognizer.energy_threshold:.1f}. If your voice never triggers it, try lowering recognizer.energy_threshold or speaking louder/closer to the mic.")
                     timed_out = True
                     break
@@ -1408,6 +2204,8 @@ def main():
                     if mic is not None:
                         _close_microphone_for_listen(mic)
                         mic = None
+
+            _play_listen_beeps(VOICE_LISTEN_END_BEEPS)
 
             if timed_out:
                 voice_timeout_streak += 1
@@ -1430,19 +2228,48 @@ def main():
                 voice_timeout_streak = 0
                 continue
 
-            voice_timeout_streak = 0
+            had_recent_timeouts = voice_timeout_streak > 0
 
             # stt
             # ----------------------------------------------------------------
             gray_print('stt ...')
+            _result = None
+
             st = time.time()
-            _result = openai_helper.stt(audio, language=LANGUAGE)
-            gray_print(f"stt takes: {time.time() - st:.3f} s")
+            offline_result = _offline_command_stt(audio)
+            offline_elapsed = time.time() - st
+            if offline_result:
+                _voice_debug(f"offline stt takes: {offline_elapsed:.3f} s")
+                offline_result = _collapse_offline_hypothesis(offline_result)
+                if _offline_transcript_is_noisy(offline_result):
+                    _voice_debug(f"Ignoring noisy offline STT text: {_shorten_for_log(offline_result)!r}")
+                    fallback_text, fallback_key = _try_openai_mode_fallback(audio, had_recent_timeouts=had_recent_timeouts)
+                    if fallback_key is not None:
+                        _result = fallback_text
+                    else:
+                        _voice_debug("")
+                        continue
+                else:
+                    _result = offline_result
+            else:
+                _voice_debug(f"offline stt miss: {offline_elapsed:.3f} s")
+                fallback_text, fallback_key = _try_openai_mode_fallback(audio, had_recent_timeouts=had_recent_timeouts)
+                if fallback_key is not None:
+                    _result = fallback_text
+
+            if not _result and OPENAI_STT_FALLBACK_WHEN_OFFLINE_MISS:
+                st = time.time()
+                _result = openai_helper.stt(audio, language=LANGUAGE)
+                _voice_debug(f"openai stt takes: {time.time() - st:.3f} s")
+            elif not _result:
+                _voice_debug("No local command recognized; listening again.")
+                _voice_debug("")
+                continue
 
             if isinstance(_result, str):
                 _result = _result.strip()
-                if _result.lower() == STT_NO_SPEECH_FILLER:
-                    print("Ignoring filler STT text from silence/noise; listening again.")
+                if _should_ignore_voice_text(_result, had_recent_timeouts=had_recent_timeouts):
+                    print(f"Ignoring low-confidence STT text: {_result!r}; listening again.")
                     print()
                     continue
 
@@ -1452,9 +2279,42 @@ def main():
 
             voice_key = _match_voice_command_key(_result)
             if voice_key is not None:
-                gray_print(f"Manual voice command: {_result!r} -> '{voice_key}'")
-                _apply_manual_key(voice_key)
+                voice_timeout_streak = 0
+                # A direct voice command should immediately own motion control and
+                # cancel any leftover async action/think state.
+                with action_lock:
+                    action_status = 'standby'
+                    actions_to_be_done = []
+                repeat_steps = _voice_command_repeat_steps(_result, voice_key)
+                gray_print(f"Manual voice command: {_result!r} -> '{voice_key}' x{repeat_steps}")
+                for _ in range(repeat_steps):
+                    _apply_manual_key(voice_key)
+
+                # Keep forward/backward persistent by default; only explicit stop/reset
+                # should clear any existing throttle failsafe deadline.
+                if voice_key in ('s', 'r'):
+                    voice_motion_failsafe_until = 0.0
+
+                if voice_key in VOICE_REPEATABLE_INCREMENT_KEYS:
+                    cooldown = VOICE_POST_MOTION_COOLDOWN_SEC
+                else:
+                    cooldown = VOICE_POST_COMMAND_COOLDOWN_SEC
+                voice_command_cooldown_until = time.time() + cooldown
                 continue
+
+            if not VOICE_MODE_CHAT_ENABLED:
+                print(f"Ignoring non-command voice text (command-only mode): {_result!r}")
+                print()
+                continue
+
+            if VOICE_REQUIRE_WAKE_WORD_FOR_CHAT and not _has_chat_wake_word(_result):
+                print(f"Ignoring non-command voice text (no wake word): {_result!r}")
+                print()
+                continue
+
+            # A non-command transcript made it through the filter; treat this as a
+            # deliberate chat turn and reset timeout recovery state.
+            voice_timeout_streak = 0
 
         elif input_mode == 'keyboard':
             with action_lock:
