@@ -68,21 +68,34 @@ TTS_VOICE = 'nova'  # alloy, echo, fable, onyx, nova, or shimmer
 VOICE_INSTRUCTIONS = ""  # https://www.openai.fm/
 STT_NO_SPEECH_FILLER = "this is the conversation between me and a robot"
 VOICE_TIMEOUT_FALLBACK_COUNT = 6
-VOICE_MIN_ENERGY_THRESHOLD = 35.0
+VOICE_MIN_ENERGY_THRESHOLD = 20.0
 VOICE_MAX_ENERGY_THRESHOLD = 95.0
-VOICE_TIMEOUT_BACKOFF = 0.7
+VOICE_TIMEOUT_BACKOFF = 0.6
 VOICE_LISTEN_TIMEOUT_SEC = 4
 VOICE_PHRASE_TIME_LIMIT_SEC = 2.5
+VOICE_PHRASE_THRESHOLD_SEC = 0.12
+VOICE_PAUSE_THRESHOLD_SEC = 0.7
+VOICE_NON_SPEAKING_DURATION_SEC = 0.6
 VOICE_LISTEN_CUE_ENABLED = True
 VOICE_LISTEN_START_BEEPS = 1
 VOICE_LISTEN_END_BEEPS = 2
 VOICE_LISTEN_BEEP_GAP_SEC = 0.12
-VOICE_LISTEN_BEEP_FREQ_HZ = 880
-VOICE_LISTEN_BEEP_DURATION_SEC = 0.06
+VOICE_LISTEN_BEEP_FREQ_HZ = 1040
+VOICE_LISTEN_BEEP_DURATION_SEC = 0.2
+VOICE_LISTEN_BEEP_AMPLITUDE = 26000
+VOICE_STARTUP_SELF_TEST_CUE_ENABLED = True
+VOICE_OUTPUT_TARGET_VOLUME = 85
 VOICE_POST_COMMAND_COOLDOWN_SEC = 1.0
 VOICE_POST_MOTION_COOLDOWN_SEC = 0.15
+VOICE_PAN_INTENT_TIMEOUT_SEC = 3.0
+VOICE_TWO_STEP_PAN_ENABLED = True
 VOICE_MAX_REPEAT_STEPS = 4
 VOICE_REPEATABLE_INCREMENT_KEYS = ('w', 'x', 'a', 'd', 'i', 'm', 'j', 'l')
+VOICE_PERMISSIVE_FALLTHROUGH_MATCH = False
+VOICE_STRAIGHT_MISHEAR_RECOVERY = False
+VOICE_STRICT_CAMERA_COMMANDS = True
+VOICE_BARE_DIRECTION_AS_PAN = False
+VOICE_CONTROL_MODE_DEFAULT = "drive"  # "drive" or "camera"
 # Throttle hold timeout for voice forward/backward. Set to 0 to keep moving
 # until an explicit stop/reset command is spoken.
 VOICE_THROTTLE_FAILSAFE_SEC = 0.0
@@ -96,7 +109,7 @@ OFFLINE_SECOND_PASS_KEYWORD_SPOTTING = False
 OFFLINE_CRITICAL_COMMAND_SPOTTING = False
 OFFLINE_CRITICAL_KEYWORD_WEIGHT = 1e-20
 OFFLINE_STT_ENGINE = "vosk"  # "vosk" or "pocketsphinx"
-OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK = True
+OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK = False
 VOSK_MODEL_PATH = os.environ.get("PICARX_VOSK_MODEL_PATH", "./vosk-model-small-en-us-0.15")
 VOSK_SAMPLE_RATE = 16000
 VOICE_VERBOSE_LOGS = False
@@ -118,6 +131,10 @@ ZEN_THOUGHTS = (
     "Quiet sensors, clear choices, smooth motion.",
     "I'm sorry Dave, I'm afraid I can't do that.",
 )
+
+# Prefer PiCar-X HiFiBerry DAC playback unless explicitly overridden
+# Such as "usb_card" or other USB sound cards
+os.environ.setdefault("PICARX_AUDIO_CARD_HINT", "snd_rpi_hifiberry_dac")
 
 import readline # optimize keyboard input, only need to import
 
@@ -152,6 +169,7 @@ import re
 import sys
 import subprocess
 import signal
+import shutil
 
 for parent in Path(__file__).resolve().parents:
     if (parent / "picarx").is_dir():
@@ -295,13 +313,14 @@ except Exception:
     SunfounderBattery = None
 
 import time
+from time import sleep
 import threading
 import random
 
 # Global runtime defaults keep the script safe when imported for smoke tests or when
 # no audio capture hardware is available on startup.
 input_mode = "voice"
-with_img = True
+with_img = False
 audio_profile = "auto"
 audio_device_override = None
 my_car = None
@@ -310,7 +329,29 @@ led = None
 battery = None
 openai_helper = None
 
-os.popen("pinctrl set 20 op dh") # enable robot_hat speake switch
+def _enable_speaker_power_switch():
+    """Enable robot_hat speaker switch and report failures instead of silently ignoring them."""
+    cmd = ["pinctrl", "set", "20", "op", "dh"]
+    try:
+        result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    if os.geteuid() != 0:
+        try:
+            result = subprocess.run(["sudo", "-n"] + cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+    print("Warning: unable to enable speaker power switch (GPIO 20). Audio may be inaudible; run with sudo if needed.")
+    return False
+
+
+_enable_speaker_power_switch()
 current_path = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_path) # change working directory
 
@@ -429,6 +470,62 @@ def _resolve_alsa_card_index(name_hints, default=None):
     return default
 
 
+def _prepare_audio_cards():
+    """Best-effort ALSA card preparation and probe before playback routing."""
+    auto_card = Path("/usr/local/bin/auto_sound_card")
+    if auto_card.exists():
+        subprocess.run([str(auto_card)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if os.environ.get("PICARX_KILL_PULSEAUDIO", "0") == "1":
+        subprocess.run(["pkill", "-f", "pulseaudio"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _ in range(20):
+        try:
+            cards_probe = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="ignore")
+            if re.search(r"^\s*\d+\s+\[[^\]]+\]:", cards_probe, re.MULTILINE):
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+
+def _detect_preferred_output_card(preferred_hint):
+    """Return (hifiberry_id, selected_id, selected_name) from ALSA card list."""
+    hifiberry_id = None
+    selected_id = None
+    selected_name = None
+    detected_cards = []
+
+    try:
+        cards = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None, None, None
+
+    for line in cards.splitlines():
+        match = re.search(r"^\s*(\d+)\s+\[([^\]]+)\]:", line)
+        if not match:
+            continue
+        card_id = match.group(1)
+        card_name = match.group(2)
+        lower_line = line.lower()
+        detected_cards.append((card_id, card_name, lower_line))
+        if "snd_rpi_hifiberry_dac" in lower_line or "hifiberry" in lower_line:
+            hifiberry_id = card_id
+
+    if preferred_hint:
+        hint = preferred_hint.strip().lower()
+        for card_id, card_name, lower_line in detected_cards:
+            if hint in lower_line or hint in card_name.lower():
+                selected_id = card_id
+                selected_name = card_name
+                break
+
+    if selected_id is None and preferred_hint and detected_cards:
+        selected_id, selected_name, _ = detected_cards[0]
+
+    return hifiberry_id, selected_id, selected_name
+
+
 def _apply_audio_route(profile_name=None, device_override=None):
     """Set ALSA environment variables for separate input and output routes.
 
@@ -438,8 +535,20 @@ def _apply_audio_route(profile_name=None, device_override=None):
     if profile_name is not None:
         profile_name = profile_name.lower()
 
+    _prepare_audio_cards()
+
     usb_card = _resolve_alsa_card_index(("usb", "device"), default="3")
-    hifiberry_card = _resolve_alsa_card_index(("hifiberry",), default="2")
+    preferred_hint = os.environ.get("PICARX_AUDIO_CARD_HINT", "snd_rpi_hifiberry_dac")
+    hifiberry_card, selected_card_id, selected_card_name = _detect_preferred_output_card(preferred_hint)
+    if hifiberry_card is None:
+        hifiberry_card = selected_card_id or _resolve_alsa_card_index(("hifiberry",), default="2")
+
+    auto_card_name = "snd_rpi_hifiberry_dac"
+    auto_hint = "snd_rpi_hifiberry_dac"
+    if selected_card_name:
+        auto_card_name = selected_card_name
+    if preferred_hint:
+        auto_hint = preferred_hint
 
     playback_preset = {
         "hdmi": {
@@ -461,14 +570,14 @@ def _apply_audio_route(profile_name=None, device_override=None):
             "PICARX_AUDIODEV": f"plughw:{hifiberry_card},0",
             "PICARX_AUDIO_CARD_ID": hifiberry_card,
             "PICARX_AUDIO_CARD_NAME": "snd_rpi_hifiberry_dac",
-            "PICARX_AUDIO_CARD_HINT": "hifiberry",
+            "PICARX_AUDIO_CARD_HINT": "snd_rpi_hifiberry_dac",
         },
         "auto": {
-            "AUDIODEV": f"plughw:{usb_card},0",
-            "PICARX_AUDIODEV": f"plughw:{usb_card},0",
-            "PICARX_AUDIO_CARD_ID": usb_card,
-            "PICARX_AUDIO_CARD_NAME": "USB PnP Audio Device",
-            "PICARX_AUDIO_CARD_HINT": "usb_audio",
+            "AUDIODEV": f"plughw:{hifiberry_card},0",
+            "PICARX_AUDIODEV": f"plughw:{hifiberry_card},0",
+            "PICARX_AUDIO_CARD_ID": hifiberry_card,
+            "PICARX_AUDIO_CARD_NAME": auto_card_name,
+            "PICARX_AUDIO_CARD_HINT": auto_hint,
         },
     }.get(profile_name or "auto", {})
 
@@ -482,9 +591,30 @@ def _apply_audio_route(profile_name=None, device_override=None):
         if device_override:
             os.environ["AUDIODEV"] = device_override
             os.environ["PICARX_AUDIODEV"] = device_override
-            os.environ.setdefault("PICARX_AUDIO_CARD_ID", "2")
-            os.environ.setdefault("PICARX_AUDIO_CARD_NAME", "speaker")
-            os.environ.setdefault("PICARX_AUDIO_CARD_HINT", "output")
+
+            # Keep mixer card selection aligned with --audio-device so beeps/TTS volume
+            # controls target the same output card the audio stream is using.
+            override_card_id = None
+            card_match = re.search(r"(?:^|:)(?:plughw:|hw:)?(\d+),\d+", device_override)
+            if card_match:
+                override_card_id = card_match.group(1)
+            else:
+                named_card_match = re.search(r"CARD=([^,]+)", device_override, flags=re.IGNORECASE)
+                if named_card_match:
+                    named_card = named_card_match.group(1)
+                    override_card_id = _resolve_alsa_card_index((named_card,), default=None)
+
+            if override_card_id is not None:
+                os.environ["PICARX_AUDIO_CARD_ID"] = str(override_card_id)
+            else:
+                os.environ.setdefault("PICARX_AUDIO_CARD_ID", str(hifiberry_card or "2"))
+
+            if hifiberry_card is not None and str(override_card_id) == str(hifiberry_card):
+                os.environ["PICARX_AUDIO_CARD_NAME"] = "snd_rpi_hifiberry_dac"
+                os.environ["PICARX_AUDIO_CARD_HINT"] = "snd_rpi_hifiberry_dac"
+            else:
+                os.environ.setdefault("PICARX_AUDIO_CARD_NAME", "speaker")
+                os.environ.setdefault("PICARX_AUDIO_CARD_HINT", "output")
             return
 
     for key, value in playback_preset.items():
@@ -494,12 +624,47 @@ def _apply_audio_route(profile_name=None, device_override=None):
         print(f"Playback route selected: {profile_name}")
 
 
+def _prime_output_mixer_volume(target_percent=VOICE_OUTPUT_TARGET_VOLUME):
+    """Unmute and set a usable playback volume on the selected ALSA card."""
+    if not shutil.which("amixer"):
+        return
+
+    try:
+        percent = int(float(target_percent))
+    except Exception:
+        percent = VOICE_OUTPUT_TARGET_VOLUME
+    percent = max(0, min(100, percent))
+
+    card_id = os.environ.get("PICARX_AUDIO_CARD_ID")
+    amixer_base = ["amixer"]
+    if card_id:
+        amixer_base += ["-c", str(card_id)]
+
+    controls = subprocess.run(
+        amixer_base + ["scontrols"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    controls_out = controls.stdout or ""
+
+    for control_name in ("Digital", "PCM", "DAC", "Speaker", "Master", "Headphone", "Line Out"):
+        if f"'{control_name}'" not in controls_out:
+            continue
+        subprocess.run(
+            amixer_base + ["set", control_name, f"{percent}%", "unmute"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def initialize_runtime():
     global input_mode, with_img, audio_profile, audio_device_override
     global my_car, music, led, openai_helper
 
     input_mode = None
-    with_img = True
+    with_img = False
     args = sys.argv[1:]
 
     # audio selection is a CLI option instead of editing environment variables by hand
@@ -511,6 +676,8 @@ def initialize_runtime():
             input_mode = 'keyboard'
         elif low == "--voice":
             input_mode = 'voice'
+        elif low in {"--img", "--with-img"}:
+            with_img = True
         elif low == "--no-img":
             with_img = False
         elif low in {"--audio", "--audio-profile"} and i + 1 < len(args):
@@ -521,12 +688,16 @@ def initialize_runtime():
     if input_mode is None:
         input_mode = 'voice'
 
+    if not with_img:
+        print("Headless mode: camera disabled by default. Use --img to enable Vilib camera features.")
+
     # Startup health check: clear stale ALSA holders before initializing playback.
     _cleanup_stale_audio_processes()
     if audio_device_override:
         _apply_audio_route(device_override=audio_device_override)
     else:
         _apply_audio_route(audio_profile)
+    _prime_output_mixer_volume()
 
     # The capture side must remain separate from the speaker path.
     output_name = os.environ.get("PICARX_AUDIO_CARD_NAME") or "default output"
@@ -536,6 +707,7 @@ def initialize_runtime():
         print(f"Audio config: output={output_name} ({output_dev}), input=PyAudio device index {capture_index}.")
     else:
         print(f"Audio config: output={output_name} ({output_dev}), input=no capture device detected yet.")
+    _run_startup_audio_self_check()
 
     # For backwards compatibility with the original example setup, keep these as defaults.
     os.environ.setdefault("SDL_AUDIODRIVER", "alsa")
@@ -576,7 +748,15 @@ def initialize_runtime():
         my_car = Picarx()
         time.sleep(1)
     except Exception as e:
-        raise RuntimeError(e)
+        print(f"Car hardware unavailable ({e}); continuing in audio-only safe mode.")
+
+        class _NullCar:
+            def __getattr__(self, _name):
+                def _noop(*_args, **_kwargs):
+                    return None
+                return _noop
+
+        my_car = _NullCar()
 
     try:
         with _quiet_alsa():
@@ -627,7 +807,19 @@ def initialize_runtime():
 
             music = _NullMusic()
 
-    led = Pin('LED')
+    try:
+        led = Pin('LED')
+    except Exception as exc:
+        print(f"LED unavailable ({exc}); continuing without LED status indicator.")
+
+        class _NullLed:
+            def on(self):
+                return None
+
+            def off(self):
+                return None
+
+        led = _NullLed()
 
     # battery init
     # =================================================================
@@ -726,6 +918,7 @@ def _probe_input_device_index():
                 return preferred
 
         preferred_names = ["usb", "mic", "capture", "input", "audio"]
+        deprefer_names = ["hifiberry", "wm8960", "hdmi", "vc4", "bcm2835"]
         explicit_candidates = []
         best_index = None
         best_score = -1
@@ -752,8 +945,10 @@ def _probe_input_device_index():
                 score += 10
             if any(token in name for token in preferred_names):
                 score += 5
-            if "hifiberry" in name or "wm8960" in name or "robot" in name or "robot_hat" in name:
-                score += 15
+            if any(token in name for token in deprefer_names):
+                score -= 25
+            if "robot" in name or "robot_hat" in name:
+                score -= 10
             if score > best_score:
                 best_index = idx
                 best_score = score
@@ -832,6 +1027,10 @@ def _open_microphone_for_listen(device_index=None):
                     for channels in (1, 2):
                         if channels <= max_input:
                             preferred_channels.append(channels)
+                    # Some USB mics reject mono/stereo despite reporting maxInputChannels;
+                    # include the device's advertised maximum as a last-resort attempt.
+                    if max_input not in preferred_channels and max_input <= 8:
+                        preferred_channels.append(max_input)
             except Exception:
                 pass
             finally:
@@ -914,6 +1113,11 @@ recognizer.dynamic_energy_ratio = 1.6
 # and then reject normal speech for many consecutive turns.
 recognizer.dynamic_energy_threshold = False
 recognizer.energy_threshold = 70
+# Capture short leading words (e.g., "pan") more reliably instead of dropping
+# them as too short/noisy at phrase boundaries.
+recognizer.phrase_threshold = VOICE_PHRASE_THRESHOLD_SEC
+recognizer.pause_threshold = VOICE_PAUSE_THRESHOLD_SEC
+recognizer.non_speaking_duration = VOICE_NON_SPEAKING_DURATION_SEC
 
 # speak_hanlder
 # =================================================================
@@ -980,8 +1184,8 @@ speak_thread.daemon = True
 
 # actions thread
 # =================================================================
-action_status = 'standby' # 'standby', 'think', 'actions', 'actions_done'
-led_status = 'standby' # 'standby', 'think' or 'actions', 'actions_done'
+action_status = 'standby' # 'standby', 'think', 'actions', 'actions_done', 'start listen', 'end listen'
+led_status = 'standby' # 'standby', 'think' or 'actions', 'actions_done', 'start listen', 'end listen'
 last_action_status = 'standby'
 last_led_status = 'standby'
 
@@ -1079,6 +1283,46 @@ def action_handler():
                     led.on()
                 except Exception as exc:
                     print(f"LED update error (actions): {exc}")
+                last_led_time = time.time()
+        elif led_status == 'start listen':
+            try: # led sequence for start listen- four long blinks
+                led.off() 
+                led.on()
+                sleep(.2)
+                led.off()
+                sleep(.1)
+                led.on()
+                sleep(.2)
+                led.off()
+                sleep(.1)
+                led.off()
+                led.on()
+                sleep(.2)
+                led.off()
+                sleep(.1)
+            except Exception as exc:
+                print(f"LED update error (start listen): {exc}")
+            last_led_time = time.time()
+        elif led_status == 'end listen':
+            try:# led sequence for end listen- five quick short blinks
+                led.off() 
+                led.on()
+                sleep(.1)
+                led.off()
+                sleep(.05)
+                led.on()
+                sleep(.1)
+                led.off()
+                sleep(.05)
+                led.off()
+                led.on()
+                sleep(.1)
+                sleep(.05)  
+                led.off() 
+                sleep(.1)   
+            except Exception as exc:
+                print(f"LED update error (end listen): {exc}")
+            last_led_time = time.time() 
 
         # actions
         # ------------------------------
@@ -1240,6 +1484,15 @@ def _speak_text(text) -> None:
 
 def _play_tts_file_and_wait(audio_file):
     global tts_file, speech_loaded
+    # Prefer direct ALSA playback so speech still works when robot_hat.Music fails to init.
+    if _play_wav_with_aplay(audio_file):
+        with speech_lock:
+            speech_loaded = False
+        return True
+
+    if music is None or type(music).__name__ == "_NullMusic":
+        return False
+
     with speech_lock:
         tts_file = audio_file
         speech_loaded = True
@@ -1253,8 +1506,10 @@ def _play_tts_file_and_wait(audio_file):
             print("Local TTS wait timeout; clearing speech flag and continuing.")
             with speech_lock:
                 speech_loaded = False
-            break
+            return False
         time.sleep(.01)
+
+    return True
 
 
 def _synthesize_local_tts_wav(text, output_wav):
@@ -1290,8 +1545,7 @@ def _speak_text_local(text):
         return True
 
     # Fallback to the existing music worker path if direct ALSA playback is unavailable.
-    _play_tts_file_and_wait(local_out)
-    return True
+    return _play_tts_file_and_wait(local_out)
 
 
 def _play_wav_with_aplay(audio_file):
@@ -1311,26 +1565,55 @@ def _play_wav_with_aplay(audio_file):
     if aplay_path is None:
         return False
 
-    device = os.environ.get("PICARX_AUDIODEV") or os.environ.get("AUDIODEV")
-    cmd = [aplay_path, "-q"]
-    if device:
-        cmd.extend(["-D", device])
-    cmd.append(audio_file)
+    device_candidates = []
+    env_device = os.environ.get("PICARX_AUDIODEV") or os.environ.get("AUDIODEV")
+    card_id = os.environ.get("PICARX_AUDIO_CARD_ID")
+    card_name = os.environ.get("PICARX_AUDIO_CARD_NAME")
+    hint = os.environ.get("PICARX_AUDIO_CARD_HINT", "").strip().lower()
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=ZEN_LOCAL_PLAYBACK_TIMEOUT_SEC,
-        )
-        return proc.returncode == 0
-    except Exception:
-        return False
+    if env_device:
+        device_candidates.append(env_device)
+    if card_id:
+        device_candidates.extend([f"plughw:{card_id},0", f"hw:{card_id},0"])
+    if card_name:
+        device_candidates.extend([f"plughw:CARD={card_name},DEV=0", f"hw:CARD={card_name},DEV=0"])
+
+    # Resolve a fresh card id from /proc so dynamic card reordering doesn't break playback.
+    if hint:
+        hinted_id = _resolve_alsa_card_index((hint,), default=None)
+        if hinted_id:
+            device_candidates.extend([f"plughw:{hinted_id},0", f"hw:{hinted_id},0"])
+    hifi_id = _resolve_alsa_card_index(("snd_rpi_hifiberry_dac", "hifiberry"), default=None)
+    if hifi_id:
+        device_candidates.extend([f"plughw:{hifi_id},0", f"hw:{hifi_id},0"])
+
+    device_candidates.append(None)
+
+    unique_candidates = []
+    for dev in device_candidates:
+        if dev not in unique_candidates:
+            unique_candidates.append(dev)
+
+    for dev in unique_candidates:
+        cmd = [aplay_path, "-q", audio_file] if dev is None else [aplay_path, "-q", "-D", dev, audio_file]
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=ZEN_LOCAL_PLAYBACK_TIMEOUT_SEC,
+            )
+            if proc.returncode == 0:
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 _listen_beep_wav = None
+_listen_beep_failed_logged = False
 
 
 def _ensure_listen_beep_wav():
@@ -1342,7 +1625,7 @@ def _ensure_listen_beep_wav():
     beep_path = "./tts/listen_beep.wav"
     sample_rate = 16000
     samples = max(1, int(VOICE_LISTEN_BEEP_DURATION_SEC * sample_rate))
-    amplitude = 9000
+    amplitude = max(1000, min(30000, int(VOICE_LISTEN_BEEP_AMPLITUDE)))
 
     try:
         with wave.open(beep_path, "wb") as wav_file:
@@ -1361,6 +1644,7 @@ def _ensure_listen_beep_wav():
 
 
 def _play_listen_beeps(count):
+    global _listen_beep_failed_logged
     if not VOICE_LISTEN_CUE_ENABLED or count <= 0:
         return
 
@@ -1369,15 +1653,49 @@ def _play_listen_beeps(count):
         return
 
     for idx in range(count):
-        played = _play_wav_with_aplay(beep_path)
-        if not played:
-            try:
-                # Fallback to robot_hat audio path when direct aplay output is unavailable.
-                music.sound_play(beep_path, _resolve_tts_playback_volume())
-            except Exception:
-                pass
+        backend = _play_single_beep_with_backend(beep_path)
+        if backend == "bell" and not _listen_beep_failed_logged:
+            print("Listen cue audio unavailable; using terminal bell fallback.")
+            _listen_beep_failed_logged = True
         if idx < count - 1:
             time.sleep(VOICE_LISTEN_BEEP_GAP_SEC)
+
+
+def _play_single_beep_with_backend(beep_path):
+    played = _play_wav_with_aplay(beep_path)
+    if played:
+        return "aplay"
+
+    # If ALSA is temporarily locked, clear stale holders and retry once.
+    _cleanup_stale_audio_processes()
+    played = _play_wav_with_aplay(beep_path)
+    if played:
+        return "aplay-retry"
+
+    if music is not None and type(music).__name__ != "_NullMusic":
+        try:
+            # Fallback to robot_hat audio path when direct aplay output is unavailable.
+            music.sound_play(beep_path, _resolve_tts_playback_volume())
+            return "music"
+        except Exception:
+            pass
+
+    # Last-resort cue so users still get an audible/visible prompt in terminals.
+    print("\a", end="", flush=True)
+    return "bell"
+
+
+def _run_startup_audio_self_check():
+    if not VOICE_STARTUP_SELF_TEST_CUE_ENABLED:
+        return
+
+    beep_path = _ensure_listen_beep_wav()
+    if not beep_path:
+        print("Startup audio self-check: skipped (unable to build cue wav).")
+        return
+
+    backend = _play_single_beep_with_backend(beep_path)
+    print(f"Startup audio self-check: cue backend={backend}.")
 
 def _follow_human_face(follow_duration: float = 60.0):
     if 'Vilib' not in globals() or Vilib is None:
@@ -1511,19 +1829,19 @@ def _apply_manual_key(key):
 
 # Recognized speech that matches one of these phrases drives the car directly instead of going through GPT.
 _VOICE_COMMAND_KEYS = {
-    'w': ('forward', 'go forward', 'move forward', 'drive forward'),
+    'w': ('forward', 'go forward', 'move forward', 'drive forward', 'go straight', 'straight ahead'),
     'x': ('backward', 'back up', 'go backward', 'move backward', 'go back', 'move back', 'reverse'),
-    'a': ('left', 'turn left', 'left turn','steer left', 'go left'),
-    'd': ('right', 'turn right', 'right turn', 'steer right', 'go right'),
+    'a': ('turn left', 'left turn','steer left', 'go left', 'move left'),
+    'd': ('turn right', 'right turn', 'steer right', 'go right', 'move right'),
     's': ('stop', 'halt', 'brake', 'quit', 'exit', 'cancel'),
     'r': ('reset', 'reset car', 'reset motor', 'reset direction'),
-    'i': ('tilt up', 'look up', 'head up', 'tilt head up'),
-    'm': ('tilt down', 'look down', 'head down', 'tilt head down'),
-    'k': ('center', 'center head', 'look straight', 'reset head'),
-    'j': ('pan left', 'look left', 'pan head left'),
-    'l': ('pan right', 'look right', 'pan head right'),
+    'i': ('tilt up', 'tilt head up', 'tilt camera up'),
+    'm': ('tilt down', 'tilt head down', 'tilt camera down'),
+    'k': ('center head', 'center camera', 'reset head', 'reset camera'),
+    'j': ('pan left',),
+    'l': ('pan right',),
     'v': ('voice input', 'activate voice input'),
-    'c': ('camera', 'activate camera', 'start camera'),
+    'c': ('activate camera', 'start camera', 'camera mode'),
     'b': ('battery check', 'check battery', 'battery status'),
     't': ('manual input', 'type commands', 'switch to keyboard', 'keyboard mode'),
     'f': ('follow face', 'follow the face', 'follow that face', 'follow human face', 'track face', 'track human face'),
@@ -1537,17 +1855,78 @@ _VOICE_COMMAND_KEYS = {
 _VOICE_COMMAND_ALIASES = {
     "for a word": "forward",
     "for word": "forward",
+    "four word": "forward",
+    "fore word": "forward",
+    "foreward": "forward",
+    "foreword": "forward",
     "forwards": "forward",
     "go for": "go forward",
     "go four": "go forward",
+    "forard": "forward",
+    "go forard": "go forward",
+    "move forard": "move forward",
+    "drive forard": "drive forward",
+    "go strait": "go straight",
+    "strait": "straight",
+    "move strait": "move straight",
+    "drive strait": "drive straight",
+    "straight a head": "straight ahead",
+    "go for word": "go forward",
+    "go four word": "go forward",
+    "go foreword": "go forward",
+    "move for word": "move forward",
+    "move foreword": "move forward",
+    "key board": "keyboard",
+    "keybord": "keyboard",
+    "key word": "keyboard",
+    "type mode": "keyboard mode",
+    "manual mode": "keyboard mode",
+    "back": "backward",
+    "bak": "backward",
+    "bac": "backward",
+    "backfward": "backward",
+    "go backfward": "go backward",
     "back word": "backward",
     "backwards": "backward",
-    "back": "backward",
-    "wright": "right",
+    "leftt": "left",
+    "leff": "left",
+    "lft": "left",
     "rite": "right",
+    "write": "right",
+    "rght": "right",
+    "rihgt": "right",
+    "turn lift": "turn left",
+    "turn leff": "turn left",
+    "turn lft": "turn left",
+    "go lift": "go left",
+    "go leff": "go left",
+    "move lift": "move left",
+    "move leff": "move left",
+    "steer lift": "steer left",
+    "steer leff": "steer left",
+    "turn rite": "turn right",
+    "turn write": "turn right",
+    "turn wright": "turn right",
+    "go rite": "go right",
+    "go write": "go right",
+    "move rite": "move right",
+    "move write": "move right",
+    "steer rite": "steer right",
+    "steer write": "steer right",
+    "wright": "right",
     "pen": "pan",
+    "pam": "pan",
+    "pawn": "pan",
+    "pan lift": "pan left",
+    "pan pan left": "pan left",
+    "pan pan right": "pan right",
+    "pan rite": "pan right",
+    "pan write": "pan right",
+    "pan rights": "pan right",
     "lift": "left",
     "break": "brake",
+    "stahp": "stop",
+    "stoop": "stop",
     "quite": "quit",
     "quick": "quit",
     "ex it": "exit",
@@ -1558,9 +1937,8 @@ _VOICE_COMMAND_ALIASES = {
 
 _VOICE_SINGLE_WORD_KEYS = {
     "forward": "w",
+    "straight": "w",
     "backward": "x",
-    "left": "a",
-    "right": "d",
     "stop": "s",
     "halt": "s",
     "brake": "s",
@@ -1568,15 +1946,11 @@ _VOICE_SINGLE_WORD_KEYS = {
     "exit": "s",
     "cancel": "s",
     "reset": "r",
-    "up": "i",
-    "down": "m",
     "center": "k",
     "voice": "v",
-    "camera": "c",
     "battery": "b",
     "manual": "t",
     "keyboard": "t",
-    "face": "f",
     "roomba": "p",
     "zen": "z",
     "wiggle": "g",
@@ -1625,9 +1999,29 @@ def _normalize_command_text(text):
     # First pass allows exact phrase remaps, then per-token remaps for homophones.
     normalized = _VOICE_COMMAND_ALIASES.get(normalized, normalized)
     tokens = [_VOICE_COMMAND_ALIASES.get(tok, tok) for tok in normalized.split()]
+
+    # Collapse duplicated leading pan token from recognizer drift:
+    # "pan pan left" -> "pan left", "pan pan right" -> "pan right".
+    if len(tokens) >= 3 and tokens[0] == "pan" and tokens[1] == "pan":
+        tokens = [tokens[0]] + tokens[2:]
+
+    # Normalize simple plural artifacts on direction tokens.
+    if tokens:
+        tokens = ["right" if t == "rights" else "left" if t == "lefts" else t for t in tokens]
     return " ".join(tokens), tokens
 
 def _match_voice_command_key(text):
+    raw = re.sub(r"[^a-z0-9\s]", " ", str(text or "").strip().lower())
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    # Keep straight-ahead intent from being misrouted to steering right when
+    # recognizer output is slightly noisy (e.g. strait/straight variants).
+    if raw:
+        straight_markers = ("straight", "strait", "ahead")
+        camera_markers = ("pan", "look", "head", "camera", "cam")
+        if any(marker in raw for marker in straight_markers) and not any(marker in raw for marker in camera_markers):
+            return 'w'
+
     normalized, tokens = _normalize_command_text(text)
 
     if not normalized:
@@ -1635,6 +2029,40 @@ def _match_voice_command_key(text):
 
     if not tokens:
         return None
+
+    # Safety first: if stop intent appears anywhere in the transcript,
+    # always honor STOP over motion or mode-switch phrases.
+    if any(token in ("stop", "halt", "brake", "quit", "exit", "cancel") for token in tokens):
+        return 's'
+
+    # Ambiguous bare "go" is unsafe for a moving robot; fail-safe to STOP.
+    if len(tokens) == 1 and tokens[0] == "go":
+        return 's'
+
+    # Bare "down" is frequently produced when users say "stop" on this mic stack.
+    # Require explicit phrases like "tilt down" for camera motion; fail-safe here.
+    if len(tokens) == 1 and tokens[0] == "down":
+        return 's'
+
+    # Additional safety: treat up/down as camera tilt only when the user explicitly
+    # says "tilt". Phrases like "look down" are too easy STT confusions for "stop".
+    if any(token in ("up", "down") for token in tokens) and "tilt" not in tokens:
+        return 's'
+
+    # On this stack, Vosk can occasionally drop the leading "pan" and return only
+    # "left"/"right" for pan commands. In strict camera mode, recover those as pan
+    # directions instead of ignoring them.
+    if VOICE_STRICT_CAMERA_COMMANDS and VOICE_BARE_DIRECTION_AS_PAN and len(tokens) == 1:
+        if tokens[0] == "left":
+            return 'j'
+        if tokens[0] == "right":
+            return 'l'
+
+    # Mode-switch intent should win over camera false positives in noisy audio.
+    if raw in ("key board", "keybord", "key word"):
+        return 't'
+    if any(token in ("keyboard", "manual", "type") for token in tokens):
+        return 't'
 
     # Keep wiggle available as an explicit one-word command only.
     if normalized == "wiggle":
@@ -1649,6 +2077,28 @@ def _match_voice_command_key(text):
     # "follow that face" or "can you track the face".
     if "face" in normalized and ("follow" in normalized or "track" in normalized):
         return 'f'
+
+    # Head/camera intent must use explicit pan phrasing in strict mode so
+    # generic speech does not accidentally move servos.
+    if VOICE_STRICT_CAMERA_COMMANDS:
+        has_camera_intent = any(token in ("pan", "tilt", "head", "camera", "cam") for token in tokens)
+        if has_camera_intent:
+            if "left" in tokens and "pan" in tokens:
+                return 'j'
+            if "right" in tokens and "pan" in tokens:
+                return 'l'
+            if "up" in tokens and "tilt" in tokens:
+                return 'i'
+            if "down" in tokens and "tilt" in tokens:
+                return 'm'
+            if ("center" in tokens or "reset" in tokens) and ("head" in tokens or "camera" in tokens or "cam" in tokens):
+                return 'k'
+    else:
+        if any(token in ("pan", "look", "head", "camera", "cam") for token in tokens):
+            if "left" in tokens:
+                return 'j'
+            if "right" in tokens:
+                return 'l'
 
     # Single-word commands are common in noisy environments; check these early
     # before broader phrase containment logic.
@@ -1669,6 +2119,11 @@ def _match_voice_command_key(text):
         if repeated in _VOICE_SINGLE_WORD_KEYS:
             return _VOICE_SINGLE_WORD_KEYS[repeated]
 
+    # In command-driving mode, ambiguous partial matches should no-op instead of
+    # triggering motion or mode changes.
+    if not VOICE_PERMISSIVE_FALLTHROUGH_MATCH:
+        return None
+
     if len(tokens) == 2:
         mapped = [(idx, _VOICE_SINGLE_WORD_KEYS.get(tok)) for idx, tok in enumerate(tokens)]
         mapped = [(idx, key) for idx, key in mapped if key is not None]
@@ -1677,7 +2132,7 @@ def _match_voice_command_key(text):
         if len(mapped) == 1:
             other_idx = 1 - mapped[0][0]
             other_token = tokens[other_idx]
-            if other_token in ("go", "move", "turn", "drive", "please"):
+            if other_token in ("go", "move", "turn", "drive", "please", "mode"):
                 return mapped[0][1]
 
     # Graceful fallback: allow phrase containment for longer commands
@@ -1724,6 +2179,45 @@ def _voice_command_repeat_steps(text, matched_key):
     return min(phrase_repeat, VOICE_MAX_REPEAT_STEPS)
 
 
+def _is_single_pan_intent(text):
+    normalized, tokens = _normalize_command_text(text)
+    if not normalized or len(tokens) != 1:
+        return False
+    return tokens[0] == "pan"
+
+
+def _detect_voice_control_mode(text):
+    normalized, tokens = _normalize_command_text(text)
+    if not normalized:
+        return None
+
+    joined = " ".join(tokens)
+    if joined in ("camera mode", "camera control", "pan mode", "head mode"):
+        return "camera"
+    if joined in ("drive mode", "driving mode", "motion mode", "car mode"):
+        return "drive"
+    return None
+
+
+def _is_voice_key_allowed_in_mode(key, control_mode):
+    if not key:
+        return False
+
+    # Safety and utility commands are available in all modes.
+    common_keys = {'s', 'b', 'z', 'g', 'v', 't'}
+    if key in common_keys:
+        return True
+
+    drive_keys = {'w', 'x', 'a', 'd', 'r', 'p'}
+    camera_keys = {'j', 'l', 'i', 'm', 'k', 'f', 'c'}
+
+    if control_mode == "camera":
+        return key in camera_keys
+
+    # Default and fallback: drive mode.
+    return key in drive_keys
+
+
 _vosk_model_cache = None
 _vosk_model_missing_logged = False
 _vosk_model_load_error_logged = False
@@ -1763,26 +2257,67 @@ def _get_vosk_model():
         return None
 
 
-def _offline_command_stt_vosk(audio):
+def _offline_command_stt_vosk(audio, control_mode="drive"):
     model = _get_vosk_model()
     if model is None:
         return None
 
-    phrases = [
-        "forward",
-        "go forward",
-        "move forward",
+    def _vosk_decode_with_phrases(phrase_list):
+        # Let Vosk emit unknowns instead of coercing every utterance to the
+        # nearest command phrase (which causes false actions like pan-left for
+        # "go forward").
+        grammar_phrases = list(phrase_list)
+        if "[unk]" not in grammar_phrases:
+            grammar_phrases.append("[unk]")
+        grammar = json.dumps(grammar_phrases)
+        try:
+            from vosk import KaldiRecognizer
+
+            raw = audio.get_raw_data(convert_rate=VOSK_SAMPLE_RATE, convert_width=2)
+            rec = KaldiRecognizer(model, VOSK_SAMPLE_RATE, grammar)
+            rec.SetWords(False)
+            rec.AcceptWaveform(raw)
+
+            result = json.loads(rec.Result() or "{}")
+            text = str(result.get("text") or "").strip()
+            if text:
+                return text
+
+            final = json.loads(rec.FinalResult() or "{}")
+            return str(final.get("text") or "").strip() or None
+        except Exception as exc:
+            print(f"Offline STT error (vosk): {exc}")
+            return None
+
+    drive_phrases = [
         "backward",
+        "backwards",
+        "go backward",
+        "go backwards",
+        "move backward",
+        "move backwards",
+        "drive backward",
+        "drive backwards",
         "back up",
         "go back",
         "move back",
         "reverse",
-        "left",
+        "forward",
+        "go forward",
+        "move forward",
+        "drive forward",
+        "go straight",
+        "move straight",
+        "drive straight",
+        "straight",
+        "straight ahead",
+        "go strait",
         "turn left",
         "go left",
-        "right",
+        "move left",
         "turn right",
         "go right",
+        "move right",
         "stop",
         "halt",
         "brake",
@@ -1790,52 +2325,54 @@ def _offline_command_stt_vosk(audio):
         "exit",
         "cancel",
         "reset",
-        "tilt up",
-        "look up",
-        "head up",
-        "tilt down",
-        "look down",
-        "head down",
-        "pan left",
-        "pan right",
-        "look left",
-        "look right",
-        "center",
-        "center head",
-        "reset head",
+        "drive mode",
+        "camera mode",
         "keyboard",
         "manual",
         "voice",
-        "camera",
         "battery",
-        "face",
-        "follow face",
-        "pretend roomba",
         "zen",
         "wiggle",
-        "wiggle gesture",
-        "do a wiggle",
+        "pretend roomba",
     ]
-    grammar = json.dumps(phrases)
 
-    try:
-        from vosk import KaldiRecognizer
+    camera_phrases = [
+        "pan",
+        "pan left",
+        "pan right",
+        "tilt up",
+        "tilt down",
+        "tilt camera up",
+        "tilt camera down",
+        "center camera",
+        "reset camera",
+        "center head",
+        "reset head",
+        "head up",
+        "head down",
+        "follow face",
+        "track face",
+        "camera mode",
+        "drive mode",
+        "stop",
+        "halt",
+        "brake",
+        "quit",
+        "exit",
+        "cancel",
+        "battery",
+        "zen",
+        "wiggle",
+    ]
 
-        raw = audio.get_raw_data(convert_rate=VOSK_SAMPLE_RATE, convert_width=2)
-        rec = KaldiRecognizer(model, VOSK_SAMPLE_RATE, grammar)
-        rec.SetWords(False)
-        rec.AcceptWaveform(raw)
+    if control_mode == "camera":
+        result = _vosk_decode_with_phrases(camera_phrases)
+        if result in ("left", "right"):
+            return f"pan {result}"
+        return result
 
-        result = json.loads(rec.Result() or "{}")
-        text = str(result.get("text") or "").strip()
-        if text:
-            return text
-
-        final = json.loads(rec.FinalResult() or "{}")
-        return str(final.get("text") or "").strip() or None
-    except Exception as exc:
-        print(f"Offline STT error (vosk): {exc}")
-        return None
+    # Default and fallback: drive-mode grammar.
+    return _vosk_decode_with_phrases(drive_phrases)
 
 
 def _offline_command_stt_pocketsphinx(audio):
@@ -1906,13 +2443,13 @@ def _offline_command_stt_pocketsphinx(audio):
         return None
 
 
-def _offline_command_stt(audio):
+def _offline_command_stt(audio, control_mode="drive"):
     """Fast local STT path for command driving; returns transcript text or None."""
     if not OFFLINE_COMMAND_STT_ENABLED:
         return None
 
     if OFFLINE_STT_ENGINE == "vosk":
-        result = _offline_command_stt_vosk(audio)
+        result = _offline_command_stt_vosk(audio, control_mode=control_mode)
         if result:
             return result
         if OFFLINE_STT_ENABLE_POCKETSPHINX_FALLBACK:
@@ -2119,6 +2656,9 @@ def main():
     voice_timeout_streak = 0
     voice_command_cooldown_until = 0.0
     voice_motion_failsafe_until = 0.0
+    pan_intent_until = 0.0
+    voice_control_mode = VOICE_CONTROL_MODE_DEFAULT
+    print(f"Voice control mode: {voice_control_mode}.")
 
     while True:
         # Check every pass so a low battery is caught regardless of which branch below
@@ -2136,13 +2676,12 @@ def main():
                 time.sleep(0.05)
                 continue
 
+            with action_lock:
+                action_status = 'start listen'
             _play_listen_beeps(VOICE_LISTEN_START_BEEPS)
             # listen
             # ----------------------------------------------------------------
             gray_print("listening ...")
-
-            with action_lock:
-                action_status = 'standby'
 
             voice_candidates = []
             selected_index = _select_input_device_index()
@@ -2205,7 +2744,11 @@ def main():
                         _close_microphone_for_listen(mic)
                         mic = None
 
+            with action_lock:
+                action_status = 'end listen'
             _play_listen_beeps(VOICE_LISTEN_END_BEEPS)
+            with action_lock:
+                action_status = 'standby'
 
             if timed_out:
                 voice_timeout_streak += 1
@@ -2222,6 +2765,13 @@ def main():
                 continue
 
             if audio is None:
+                err_text = str(last_voice_error or "")
+                if "Invalid number of channels" in err_text:
+                    print("Voice capture channel mismatch detected; clearing mic cache and retrying voice mode.")
+                    _reset_capture_device_cache()
+                    voice_timeout_streak = 0
+                    time.sleep(0.2)
+                    continue
                 print(f"Voice input unavailable for all capture candidates; falling back to keyboard input. Last error: {last_voice_error}")
                 _reset_capture_device_cache()
                 input_mode = 'keyboard'
@@ -2236,7 +2786,7 @@ def main():
             _result = None
 
             st = time.time()
-            offline_result = _offline_command_stt(audio)
+            offline_result = _offline_command_stt(audio, control_mode=voice_control_mode)
             offline_elapsed = time.time() - st
             if offline_result:
                 _voice_debug(f"offline stt takes: {offline_elapsed:.3f} s")
@@ -2268,6 +2818,30 @@ def main():
 
             if isinstance(_result, str):
                 _result = _result.strip()
+
+                mode_change = _detect_voice_control_mode(_result)
+                if mode_change is not None:
+                    if mode_change != voice_control_mode:
+                        voice_control_mode = mode_change
+                        print(f"Voice control mode switched to: {voice_control_mode}.")
+                    else:
+                        print(f"Voice control mode remains: {voice_control_mode}.")
+                    print()
+                    continue
+
+                # Two-step pan command: if user says only "pan" (or a common
+                # one-word mishear), wait briefly for a follow-up left/right.
+                _norm, _tokens = _normalize_command_text(_result)
+                _now = time.time()
+                if VOICE_TWO_STEP_PAN_ENABLED and _now <= pan_intent_until and len(_tokens) == 1 and _tokens[0] in ("left", "right"):
+                    _result = f"pan {_tokens[0]}"
+                    pan_intent_until = 0.0
+                elif VOICE_TWO_STEP_PAN_ENABLED and _is_single_pan_intent(_result):
+                    pan_intent_until = _now + VOICE_PAN_INTENT_TIMEOUT_SEC
+                    print("Pan intent heard; say left or right.")
+                    print()
+                    continue
+
                 if _should_ignore_voice_text(_result, had_recent_timeouts=had_recent_timeouts):
                     print(f"Ignoring low-confidence STT text: {_result!r}; listening again.")
                     print()
@@ -2279,6 +2853,15 @@ def main():
 
             voice_key = _match_voice_command_key(_result)
             if voice_key is not None:
+                if not _is_voice_key_allowed_in_mode(voice_key, voice_control_mode):
+                    print(
+                        f"Ignoring command in {voice_control_mode} mode: {_result!r}. "
+                        "Say 'drive mode' or 'camera mode' to switch."
+                    )
+                    print()
+                    continue
+                if voice_key in ('j', 'l', 'k', 'i', 'm'):
+                    pan_intent_until = 0.0
                 voice_timeout_streak = 0
                 # A direct voice command should immediately own motion control and
                 # cancel any leftover async action/think state.
